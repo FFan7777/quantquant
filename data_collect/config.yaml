@@ -1,0 +1,45 @@
+# Tushare API 配置
+tushare:
+  token: "1609ec078e6ceafe5cc452cf390aaf81f0d57d464ae6a2a58bc1f36f779a"
+  # 是否使用自定义 API 地址（lianghua 券商一致预期数据源）
+  use_custom_api: true
+  # API 调用频率限制（秒）
+  request_interval: 0.2
+  # 批量请求大小
+  batch_size: 100
+  # 重试次数
+  max_retries: 3
+  # 重试延迟（秒）
+  retry_delay: 5
+
+# 数据库配置
+database:
+  # DuckDB 数据库文件路径
+  db_path: "data/quant.duckdb"
+  # 是否启用 WAL 模式
+  wal_mode: true
+
+# 数据收集配置
+data_collection:
+  # 历史数据起始日期（YYYYMMDD）
+  start_date: "20140101"  # 近10年
+  # 是否收集退市股票
+  include_delisted: false
+  # 并发线程数
+  max_workers: 5
+
+# 增量更新配置
+incremental_update:
+  # 是否启用自动增量更新
+  enabled: true
+  # 更新时间（24小时制，格式：HH:MM）
+  update_time: "18:00"
+  # 是否只在交易日更新
+  trading_days_only: true
+
+# 选股策略配置
+stock_selection:
+  # CAGR 计算方式: "historical" 或 "forecast"
+  # historical: 使用净利润同比增长率 (netprofit_yoy)
+  # forecast: 使用分析师预测净利润计算 CAGR (report_rc)
+  cagr_method: "forecast"

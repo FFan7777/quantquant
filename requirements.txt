@@ -1,0 +1,4 @@
+tushare>=1.4.0
+duckdb>=0.10.0
+pandas>=2.0.0
+pyyaml>=6.0
