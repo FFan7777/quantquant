@@ -46,9 +46,9 @@ HORIZON       = 5                    # 预测窗口（交易日）
 REBAL_FREQ    = 5                    # 调仓频率（交易日）
 DATA_START    = "20160101"           # 数据加载起点（含预热期）
 TRAIN_START   = "20180101"          # 训练集起点
-TRAIN_END     = "20221231"          # 训练集终点
+TRAIN_END     = "20250630"          # 训练集终点（最新数据，生产模型）
 EMBARGO_DAYS  = 20                   # 隔离期（交易日数）
-TEST_START    = "20230201"          # 测试集起点（含20日隔离，OOS：2023-2025）
+TEST_START    = "20250801"          # 测试集起点（含20日隔离，OOS：2025H2+）
 END_DATE      = "20260311"          # 数据终点
 MIN_MKTCAP    = 2.0                  # 最小市值过滤（亿元）[从5.0降至2.0，捕获更多小盘alpha]
 OUTPUT_DIR    = "output"
@@ -863,9 +863,9 @@ def train_xgb(train: pd.DataFrame, feature_cols: list) -> xgb.XGBRegressor:
     """
     print("\n[训练] XGBoost 模型...")
 
-    # 验证集：训练集最后一年（与 TEST_START 无重叠）
+    # 验证集：训练集最后一年（动态计算，适配任意 TRAIN_END）
     train_dates = sorted(train["trade_date"].unique())
-    val_cutoff = "20220101"    # 最后一年作为 val（仍在训练窗口内）
+    val_cutoff = (pd.to_datetime(TRAIN_END) - pd.DateOffset(years=1)).strftime("%Y%m%d")
     tr_data = train[train["trade_date"] < val_cutoff]
     val_data = train[train["trade_date"] >= val_cutoff]
     print(f"  训练子集: {tr_data['trade_date'].min()} ~ {tr_data['trade_date'].max()}, "
@@ -1182,7 +1182,7 @@ def main():
         if col in panel.columns and panel[col].isna().any():
             panel[col] = panel.groupby("trade_date")[col].transform(
                 lambda x: x.fillna(x.median())
-            )
+            ).fillna(0)  # 兜底：整个截面全为 NaN 时 median 仍为 NaN，用 0 填充
 
     print(f"  最终Panel: {len(panel):,} 行, {panel['trade_date'].nunique()} 个截面")
 
@@ -1210,6 +1210,15 @@ def main():
         "importance": model.feature_importances_,
     }).sort_values("importance", ascending=False)
     feat_imp_df.to_csv(f"{OUTPUT_DIR}/csv/xgb_feature_importance.csv", index=False)
+
+    # 保存模型到磁盘（供 infer_today.py 实盘推理使用）
+    import json
+    models_dir = f"{OUTPUT_DIR}/models"
+    os.makedirs(models_dir, exist_ok=True)
+    model.save_model(f"{models_dir}/xgb_h{HORIZON}.json")
+    with open(f"{models_dir}/features_h{HORIZON}.json", "w") as f:
+        json.dump({"features": avail_features, "train_end": TRAIN_END}, f, indent=2)
+    print(f"  模型已保存: {models_dir}/xgb_h{HORIZON}.json")
 
     elapsed = time.time() - t_total
     print(f"\n{'='*60}")

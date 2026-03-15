@@ -46,25 +46,52 @@ BENCHMARK     = "000300.SH"          # 沪深300
 HORIZON       = 10                   # 预测窗口（交易日）
 REBAL_FREQ    = 5                    # 调仓频率（交易日）
 DATA_START    = "20160101"           # 数据加载起点（含预热期）
-TRAIN_START   = "20180101"          # 训练集起点
-TRAIN_END     = "20221231"          # 训练集终点
-EMBARGO_DAYS  = 20                   # 隔离期（交易日数）
-TEST_START    = "20230201"          # 测试集起点（含20日隔离，OOS：2023-2025）
-END_DATE      = "20260311"          # 数据终点
-MIN_MKTCAP    = 2.0                  # 最小市值过滤（亿元）[从5.0降至2.0，捕获更多小盘alpha]
+TRAIN_START   = "20180101"           # 训练集起点
+
+# ── 三段式严格分离的数据划分 ─────────────────────────────────────────────────
+# Train: 2018-2023  （用于超参数搜索 + 最终模型训练）
+# Val:   2024       （超参数搜索的评估集，含20日隔离期；不接触 Test）
+# Test:  2025+      （唯一真实 OOS 评测，训练全程不可见）
+TRAIN_END     = "20231231"           # 训练集终点
+EMBARGO_DAYS  = 20                   # 隔离期（交易日数，约1个月）
+VAL_START     = "20240201"           # 验证集起点（TRAIN_END后+20交易日隔离）
+VAL_END       = "20241231"           # 验证集终点
+TEST_START    = "20250201"           # 测试集起点（VAL_END后+20交易日隔离）
+END_DATE      = "20260315"           # 数据终点（当前最新）
+
+# ── 超参数搜索配置（在 Val 上搜索，不接触 Test）───────────────────────────────
+# MIN_MKTCAP 重置为保守默认值：原值5.0被基于测试集观察改为2.0（数据泄漏）
+# 若要验证最优值，应通过 Val 集比较（build_panel 已含全部市值股，过滤在此做）
+MIN_MKTCAP    = 5.0                  # 最小市值过滤（亿元，保守默认值）
+
+# XGBoost 超参搜索空间（3×2×3 = 18 组，在 Val 上搜索）
+HP_SEARCH_N_ESTIMATORS = 300        # 搜索阶段用（快速比较，非最优迭代轮数）
+XGB_HP_GRID = [
+    {"max_depth": d, "min_child_weight": mcw, "reg_lambda": rl}
+    for d in [3, 4, 5]
+    for mcw in [20, 40]
+    for rl in [5.0, 10.0, 20.0]
+]
+# 敏感性测试：对最优参数做邻近值测试（偏差应 < 0.01）
+HP_SENSITIVITY_PARAMS = {
+    "max_depth":        [2, 3, 4, 5, 6],
+    "min_child_weight": [10, 20, 30, 40, 60],
+    "reg_lambda":       [2.0, 5.0, 10.0, 15.0, 20.0, 30.0],
+}
+
 ENSEMBLE_LGB  = True                 # 是否添加 LightGBM 模型做 XGB+LGB ensemble
-WFO_MODE      = True                # Walk-Forward Optimization: 每 6 个月扩展训练窗口重训
+WFO_MODE      = False                # Walk-Forward Optimization（已测试，收益边际）
 WFO_REFIT_MONTHS = 6                 # WFO 重训间隔（月）
 OUTPUT_DIR    = "output"
 
 # 特征列名
-# 规则松弛说明:
-#   ① MIN_MKTCAP: 5亿 → 2亿，A股2023-2025小盘股alpha显著，5亿门槛过于保守
-#   ② 中性化: 保留 neutralize=True，但 money-flow/momentum 类因子天然方向性强，
-#      Ridge 中性化仅去除市值/行业系统性 beta，不影响纯 alpha
-#   ③ 新增特征: ret_120d/close_vs_ma120 (中期趋势), dv_ratio (股息率),
-#      mf_20d_mv/large_net_20d_ratio (20日资金), gross_margin_chg_yoy (毛利率拐点),
-#      ocf_to_ni (盈利质量), holder_chg_qoq (筹码集中度, 最重要A股特有因子)
+#   技术面: ret_1d~ret_120d, vol_20d, close_vs_ma20/60/120, rsi_14
+#   估值/流动性: pe_ttm, pb, log_mktcap, turnover_20d, volume_ratio, dv_ratio
+#   资金流向: mf_1d/5d/20d_mv, large_net_5d/20d_ratio
+#   基本面PIT: roe_ann, roa, gross_margin, debt_ratio, current_ratio,
+#              fscore, rev_growth_yoy, ni_growth_yoy, gross_margin_chg_yoy, ocf_to_ni
+#   分析师预期: analyst_count, np_yield
+#   股东户数: holder_chg_qoq（筹码集中度）
 TECH_COLS   = ['ret_1d', 'ret_5d', 'ret_20d', 'ret_60d', 'ret_120d',
                'vol_20d', 'close_vs_ma20', 'close_vs_ma60', 'close_vs_ma120', 'rsi_14']
 BASIC_COLS  = ['pe_ttm', 'pb', 'log_mktcap', 'turnover_20d', 'volume_ratio', 'dv_ratio']
@@ -838,124 +865,146 @@ def preprocess_panel(panel: pd.DataFrame,
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 10. 训练/测试集切分（Purged Time-Series Split）
+# 10. 三段式数据切分（Train / Val / Test 严格分离）
 # ════════════════════════════════════════════════════════════════════════════
-def split_purged(panel: pd.DataFrame) -> tuple:
+def split_train_val_test(panel: pd.DataFrame) -> tuple:
     """
-    训练集: TRAIN_START ~ TRAIN_END
-    测试集: TEST_START ~ END_DATE（已包含 EMBARGO_DAYS 隔离）
+    严格三段式切分（所有参数决策均不接触 Test）:
+      Train: TRAIN_START ~ TRAIN_END         （超参搜索 + 最终模型训练）
+      Val:   VAL_START   ~ VAL_END           （超参搜索评估 + Early Stopping）
+      Test:  TEST_START  ~ END_DATE          （唯一真实 OOS 评测）
+    各段之间含 EMBARGO_DAYS 隔离（约20交易日），防止 label lookahead。
     """
+    panel = panel.copy()
     panel["trade_date"] = panel["trade_date"].astype(str)
     train = panel[(panel["trade_date"] >= TRAIN_START) &
                   (panel["trade_date"] <= TRAIN_END)].copy()
+    val   = panel[(panel["trade_date"] >= VAL_START) &
+                  (panel["trade_date"] <= VAL_END)].copy()
     test  = panel[panel["trade_date"] >= TEST_START].copy()
-    print(f"  训练集: {train['trade_date'].min()} ~ {train['trade_date'].max()}, "
-          f"{len(train):,} 行, {train['trade_date'].nunique()} 个截面")
-    print(f"  测试集: {test['trade_date'].min()} ~ {test['trade_date'].max()}, "
-          f"{len(test):,} 行, {test['trade_date'].nunique()} 个截面")
-    return train, test
+
+    def _info(name, df):
+        if df.empty:
+            print(f"  {name}: 空")
+        else:
+            print(f"  {name}: {df['trade_date'].min()} ~ {df['trade_date'].max()}, "
+                  f"{len(df):,} 行, {df['trade_date'].nunique()} 个截面")
+    _info("Train", train)
+    _info("Val  ", val)
+    _info("Test ", test)
+    return train, val, test
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 11. XGBoost 训练
+# 11. XGBoost 训练（接受外部 val 集和超参 dict）
 # ════════════════════════════════════════════════════════════════════════════
-def train_xgb(train: pd.DataFrame, feature_cols: list) -> xgb.XGBRegressor:
+# 默认超参（超参搜索未运行时的安全回退值）
+_DEFAULT_XGB_PARAMS = dict(max_depth=4, min_child_weight=30, reg_lambda=10.0)
+
+def train_xgb(train: pd.DataFrame, feature_cols: list,
+              val: pd.DataFrame = None,
+              params: dict = None,
+              n_estimators: int = 1000) -> xgb.XGBRegressor:
     """
-    训练 XGBoost 截面排序模型（回归形式，label = 截面百分位排名）。
-    验证集: 训练集最后 12 个月（含隔离期保护，不会泄露）。
-    超参: 强正则化以避免金融数据过拟合。
+    训练 XGBoost 截面排序模型。
+    val:          外部验证集（用于 early stopping）；若不提供则无 early stopping
+    params:       超参数 dict（max_depth / min_child_weight / reg_lambda）；
+                  若不提供则使用 _DEFAULT_XGB_PARAMS
+    n_estimators: 最大迭代轮数（early stopping 可提前终止）
     """
-    print("\n[训练] XGBoost 模型...")
+    p = {**_DEFAULT_XGB_PARAMS, **(params or {})}
+    print(f"\n[训练] XGBoost  depth={p['max_depth']}  "
+          f"mcw={p['min_child_weight']}  λ={p['reg_lambda']}")
 
-    # 验证集：训练集最后一年（与 TEST_START 无重叠）
-    train_dates = sorted(train["trade_date"].unique())
-    val_cutoff = "20220101"    # 最后一年作为 val（仍在训练窗口内）
-    tr_data = train[train["trade_date"] < val_cutoff]
-    val_data = train[train["trade_date"] >= val_cutoff]
-    print(f"  训练子集: {tr_data['trade_date'].min()} ~ {tr_data['trade_date'].max()}, "
-          f"{len(tr_data):,} 行")
-    print(f"  验证子集: {val_data['trade_date'].min()} ~ {val_data['trade_date'].max()}, "
-          f"{len(val_data):,} 行")
+    X_tr = train[feature_cols].values.astype(float)
+    y_tr = train["label"].values.astype(float)
+    print(f"  训练集: {len(train):,} 行, {train['trade_date'].nunique()} 个截面")
 
-    X_tr  = tr_data[feature_cols].values.astype(float)
-    y_tr  = tr_data["label"].values.astype(float)
-    X_val = val_data[feature_cols].values.astype(float)
-    y_val = val_data["label"].values.astype(float)
-
+    use_es = val is not None and len(val) > 0
     model = xgb.XGBRegressor(
         objective        = "reg:squarederror",
-        n_estimators     = 1000,
-        max_depth        = 4,
+        n_estimators     = n_estimators,
         learning_rate    = 0.02,
         subsample        = 0.7,
         colsample_bytree = 0.7,
-        min_child_weight = 30,    # 金融数据：防止在少数样本上过拟合
-        reg_lambda       = 10.0,  # L2 正则化
-        reg_alpha        = 0.5,   # L1 正则化（稀疏特征选择）
+        reg_alpha        = 0.5,
         random_state     = 42,
         n_jobs           = -1,
         tree_method      = "hist",
-        early_stopping_rounds = 50,
+        early_stopping_rounds = 50 if use_es else None,
         eval_metric      = "rmse",
         verbosity        = 0,
+        **p,
     )
-    model.fit(
-        X_tr, y_tr,
-        eval_set=[(X_val, y_val)],
-        verbose=100,
-    )
-    best_iter = model.best_iteration
-    print(f"  最优迭代: {best_iter} 轮")
+    if use_es:
+        X_val = val[feature_cols].values.astype(float)
+        y_val = val["label"].values.astype(float)
+        print(f"  验证集: {len(val):,} 行, {val['trade_date'].nunique()} 个截面")
+        model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=200)
+        print(f"  最优迭代: {model.best_iteration} 轮")
+    else:
+        model.fit(X_tr, y_tr, verbose=False)
     return model
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 11b. LightGBM 训练（与 XGBoost ensemble）
+# 11b. LightGBM 训练（与 XGBoost ensemble，接受外部 val 集）
 # ════════════════════════════════════════════════════════════════════════════
-def train_lgbm(train: pd.DataFrame, feature_cols: list) -> lgb.Booster:
+def _xgb_params_to_lgb(xgb_params: dict) -> dict:
+    """将 XGB 超参转换为对等的 LGB 超参（对称设计）"""
+    d = xgb_params.get("max_depth", 4)
+    mcw = xgb_params.get("min_child_weight", 30)
+    rl  = xgb_params.get("reg_lambda", 10.0)
+    # LGB num_leaves ≈ 2^(max_depth-1) 以保持近似复杂度
+    num_leaves = max(7, min(63, 2 ** (d - 1)))
+    return dict(num_leaves=num_leaves, min_child_samples=mcw, reg_lambda=rl)
+
+
+def train_lgbm(train: pd.DataFrame, feature_cols: list,
+               val: pd.DataFrame = None,
+               params: dict = None,
+               n_estimators: int = 1000) -> lgb.Booster:
     """
     训练 LightGBM 截面排序模型（与 XGBoost 互补，降低集成方差）。
-    使用相同的训练/验证切分，超参对称设计。
+    val:    外部验证集（用于 early stopping）
+    params: XGB 格式超参 dict，自动转换为 LGB 等价参数
     """
-    print("\n[训练] LightGBM 模型...")
-    val_cutoff = "20220101"
-    tr_data  = train[train["trade_date"] < val_cutoff]
-    val_data = train[train["trade_date"] >= val_cutoff]
-    print(f"  训练子集: {tr_data['trade_date'].min()} ~ {tr_data['trade_date'].max()}, "
-          f"{len(tr_data):,} 行")
+    lgb_p = _xgb_params_to_lgb(params or _DEFAULT_XGB_PARAMS)
+    print(f"\n[训练] LightGBM  leaves={lgb_p['num_leaves']}  "
+          f"mcs={lgb_p['min_child_samples']}  λ={lgb_p['reg_lambda']}")
 
-    X_tr  = tr_data[feature_cols].values.astype(float)
-    y_tr  = tr_data["label"].values.astype(float)
-    X_val = val_data[feature_cols].values.astype(float)
-    y_val = val_data["label"].values.astype(float)
+    X_tr = train[feature_cols].values.astype(float)
+    y_tr = train["label"].values.astype(float)
+    print(f"  训练集: {len(train):,} 行, {train['trade_date'].nunique()} 个截面")
 
-    dtrain = lgb.Dataset(X_tr, label=y_tr, feature_name=feature_cols)
-    dval   = lgb.Dataset(X_val, label=y_val, reference=dtrain)
-
-    params = dict(
+    lgb_params = dict(
         objective        = "regression",
         metric           = "rmse",
-        num_leaves       = 31,           # 对应 max_depth≈5，比 XGB depth=4 稍深
         learning_rate    = 0.02,
-        feature_fraction = 0.7,         # colsample_bytree 对应
-        bagging_fraction = 0.7,         # subsample 对应
+        feature_fraction = 0.7,
+        bagging_fraction = 0.7,
         bagging_freq     = 5,
-        min_child_samples= 30,          # min_child_weight 对应
-        reg_lambda       = 10.0,
         reg_alpha        = 0.5,
         verbose          = -1,
         n_jobs           = -1,
+        **lgb_p,
     )
-    callbacks = [
-        lgb.early_stopping(stopping_rounds=50, verbose=False),
-        lgb.log_evaluation(period=100),
-    ]
-    model = lgb.train(
-        params, dtrain,
-        num_boost_round = 1000,
-        valid_sets      = [dval],
-        callbacks       = callbacks,
-    )
+    dtrain = lgb.Dataset(X_tr, label=y_tr, feature_name=feature_cols)
+
+    use_es = val is not None and len(val) > 0
+    if use_es:
+        X_val = val[feature_cols].values.astype(float)
+        y_val = val["label"].values.astype(float)
+        print(f"  验证集: {len(val):,} 行, {val['trade_date'].nunique()} 个截面")
+        dval = lgb.Dataset(X_val, label=y_val, reference=dtrain)
+        callbacks = [lgb.early_stopping(stopping_rounds=50, verbose=False),
+                     lgb.log_evaluation(period=200)]
+        model = lgb.train(lgb_params, dtrain, num_boost_round=n_estimators,
+                          valid_sets=[dval], callbacks=callbacks)
+    else:
+        model = lgb.train(lgb_params, dtrain, num_boost_round=n_estimators,
+                          callbacks=[lgb.log_evaluation(period=-1)])
+
     print(f"  最优迭代: {model.best_iteration} 轮")
     return model
 
@@ -963,9 +1012,11 @@ def train_lgbm(train: pd.DataFrame, feature_cols: list) -> lgb.Booster:
 def ensemble_rank_avg(panel: pd.DataFrame,
                       xgb_model: xgb.XGBRegressor,
                       lgb_model: lgb.Booster,
-                      feature_cols: list) -> pd.DataFrame:
+                      feature_cols: list,
+                      w_xgb: float = 0.5) -> pd.DataFrame:
     """
-    XGB 和 LGB 预测的截面 rank 平均，返回 panel（含 pred 列）。
+    XGB 和 LGB 预测的截面 rank 加权平均（动态权重）。
+    w_xgb: XGB 的权重（由 val Rank IC 比率动态决定，默认 0.5）
     rank-averaging 消除两个模型量纲差异，保留相对顺序信息。
     """
     X = panel[feature_cols].values.astype(float)
@@ -976,11 +1027,174 @@ def ensemble_rank_avg(panel: pd.DataFrame,
     panel["pred_xgb"] = pred_xgb
     panel["pred_lgb"] = pred_lgb
 
-    # 截面内分别 rank（百分位），再 0.5+0.5 平均
     panel["rank_xgb"] = panel.groupby("trade_date")["pred_xgb"].rank(pct=True)
     panel["rank_lgb"] = panel.groupby("trade_date")["pred_lgb"].rank(pct=True)
-    panel["pred"]     = 0.5 * panel["rank_xgb"] + 0.5 * panel["rank_lgb"]
+    panel["pred"]     = w_xgb * panel["rank_xgb"] + (1 - w_xgb) * panel["rank_lgb"]
     return panel.drop(columns=["pred_xgb", "pred_lgb", "rank_xgb", "rank_lgb"])
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 11c. 超参搜索 & 敏感性测试（在 Val 上运行，完全不接触 Test）
+# ════════════════════════════════════════════════════════════════════════════
+def _quick_ic(panel: pd.DataFrame, feature_cols: list) -> float:
+    """计算 panel 上的 Rank IC 均值（已含 pred 列）"""
+    ic_list = []
+    for _, grp in panel.groupby("trade_date"):
+        valid = grp[["pred", "excess_ret"]].dropna()
+        if len(valid) < 5:
+            continue
+        rho, _ = stats.spearmanr(valid["pred"].values, valid["excess_ret"].values)
+        ic_list.append(rho)
+    return float(np.mean(ic_list)) if ic_list else np.nan
+
+
+def quick_eval_xgb_on_val(train: pd.DataFrame, val: pd.DataFrame,
+                           feature_cols: list, params: dict) -> tuple:
+    """
+    用固定 HP_SEARCH_N_ESTIMATORS 轮快速训练，返回 (val_ic_mean, val_ic_std)。
+    不用 early stopping，保证不同参数组合的树数量相同，比较公平。
+    """
+    p = {**_DEFAULT_XGB_PARAMS, **params}
+    model = xgb.XGBRegressor(
+        objective="reg:squarederror",
+        n_estimators=HP_SEARCH_N_ESTIMATORS,
+        learning_rate=0.02,
+        subsample=0.7,
+        colsample_bytree=0.7,
+        reg_alpha=0.5,
+        random_state=42,
+        n_jobs=-1,
+        tree_method="hist",
+        verbosity=0,
+        **p,
+    )
+    X_tr = train[feature_cols].values.astype(float)
+    y_tr = train["label"].values.astype(float)
+    model.fit(X_tr, y_tr, verbose=False)
+
+    val = val.copy()
+    val["pred"] = model.predict(val[feature_cols].values.astype(float))
+    ic_list = []
+    for _, grp in val.groupby("trade_date"):
+        valid = grp[["pred", "excess_ret"]].dropna()
+        if len(valid) < 5:
+            continue
+        rho, _ = stats.spearmanr(valid["pred"].values, valid["excess_ret"].values)
+        ic_list.append(rho)
+    ic_arr = np.array(ic_list)
+    return float(ic_arr.mean()) if len(ic_arr) > 0 else np.nan, \
+           float(ic_arr.std())  if len(ic_arr) > 0 else np.nan
+
+
+def hyperparameter_search_xgb(train: pd.DataFrame, val: pd.DataFrame,
+                               feature_cols: list) -> tuple:
+    """
+    在 Val 上网格搜索 XGB_HP_GRID（18 组），返回 (best_params, results_df)。
+    全程不接触 Test 数据。
+    """
+    print(f"\n[HP搜索] 共 {len(XGB_HP_GRID)} 组参数，每组训练 {HP_SEARCH_N_ESTIMATORS} 轮")
+    rows = []
+    for i, params in enumerate(XGB_HP_GRID):
+        ic_mean, ic_std = quick_eval_xgb_on_val(train, val, feature_cols, params)
+        icir = ic_mean / ic_std if (ic_std is not None and ic_std > 0) else np.nan
+        rows.append({**params, "val_ic": ic_mean, "val_ic_std": ic_std, "val_icir": icir})
+        print(f"  [{i+1:2d}/{len(XGB_HP_GRID)}] depth={params['max_depth']}  "
+              f"mcw={params['min_child_weight']}  λ={params['reg_lambda']:.1f}  "
+              f"→ val_IC={ic_mean:+.4f}  ICIR={icir:+.3f}")
+
+    results_df = pd.DataFrame(rows).sort_values("val_icir", ascending=False)
+    best_params = {k: results_df.iloc[0][k]
+                   for k in ("max_depth", "min_child_weight", "reg_lambda")}
+    best_params["max_depth"]        = int(best_params["max_depth"])
+    best_params["min_child_weight"] = int(best_params["min_child_weight"])
+
+    print(f"\n  最优参数: depth={best_params['max_depth']}  "
+          f"mcw={best_params['min_child_weight']}  λ={best_params['reg_lambda']:.1f}")
+    print(f"  最优 val_IC={results_df.iloc[0]['val_ic']:+.4f}  "
+          f"ICIR={results_df.iloc[0]['val_icir']:+.3f}")
+    return best_params, results_df
+
+
+def sensitivity_test_xgb(train: pd.DataFrame, val: pd.DataFrame,
+                          feature_cols: list, best_params: dict) -> None:
+    """
+    对最优参数的每个维度做邻近值测试，验证模型稳定性。
+    若某维度 IC 波动 > 0.01，打印警告（参数选择可能不稳健）。
+    """
+    print("\n[敏感性测试] 对最优参数逐维度扰动（IC变化 > 0.01 视为不稳定）")
+    INSTABILITY_THRESH = 0.01
+
+    base_ic, _ = quick_eval_xgb_on_val(train, val, feature_cols, best_params)
+    print(f"  基准 val_IC = {base_ic:+.4f}  params = {best_params}")
+
+    for dim, candidates in HP_SENSITIVITY_PARAMS.items():
+        # dim 映射：HP_SENSITIVITY_PARAMS 用 min_child_samples，对应 min_child_weight
+        param_key = "min_child_weight" if dim == "min_child_samples" else dim
+        if param_key not in best_params:
+            continue
+        best_val = best_params[param_key]
+        ics = []
+        for v in candidates:
+            test_p = {**best_params, param_key: v}
+            ic, _ = quick_eval_xgb_on_val(train, val, feature_cols, test_p)
+            delta = ic - base_ic
+            flag  = "⚠ 不稳定" if abs(delta) > INSTABILITY_THRESH else "✓"
+            print(f"    {param_key}={v:<6}  IC={ic:+.4f}  Δ={delta:+.4f}  {flag}")
+            ics.append(ic)
+        ic_range = max(ics) - min(ics)
+        stability = "⚠ 参数敏感" if ic_range > INSTABILITY_THRESH else "✓ 参数稳健"
+        print(f"  → {param_key} IC范围={ic_range:.4f}  {stability}\n")
+
+
+def train_xgb_final(train: pd.DataFrame, val: pd.DataFrame,
+                    feature_cols: list, params: dict):
+    """
+    两阶段最终训练。返回: (model_final, model_train_only)
+    1. 在 train 上用 val ES 确定最优轮数 → model_train_only（供策略 val 预测使用）
+    2. 在 train+val 合并数据上用最优轮数重训（无 ES） → model_final
+    """
+    print("\n[最终训练 XGB] 阶段1: train上ES确定最优轮数（保留train-only模型供val预测）")
+    model_train_only = train_xgb(train, feature_cols, val=val, params=params, n_estimators=2000)
+    best_n = model_train_only.best_iteration
+    if best_n is None or best_n <= 0:
+        best_n = 500
+    print(f"  Early stopping 最优轮数: {best_n}")
+
+    print(f"\n[最终训练 XGB] 阶段2: train+val 合并，固定 {best_n} 轮（无 early stopping）")
+    train_val = pd.concat([train, val], ignore_index=True)
+    model_final = train_xgb(train_val, feature_cols, val=None, params=params,
+                             n_estimators=best_n)
+    return model_final, model_train_only
+
+
+def train_lgbm_final(train: pd.DataFrame, val: pd.DataFrame,
+                     feature_cols: list, params: dict):
+    """
+    两阶段最终训练（LGB）。返回: (model_final, model_train_only)
+    """
+    print("\n[最终训练 LGB] 阶段1: train上ES确定最优轮数（保留train-only模型供val预测）")
+    model_train_only = train_lgbm(train, feature_cols, val=val, params=params, n_estimators=2000)
+    best_n = model_train_only.best_iteration
+    if best_n is None or best_n <= 0:
+        best_n = 500
+    print(f"  Early stopping 最优轮数: {best_n}")
+
+    print(f"\n[最终训练 LGB] 阶段2: train+val 合并，固定 {best_n} 轮（无 early stopping）")
+    train_val = pd.concat([train, val], ignore_index=True)
+    model_final = train_lgbm(train_val, feature_cols, val=None, params=params,
+                              n_estimators=best_n)
+    return model_final, model_train_only
+
+
+def _compute_val_ic_for_model(model_xgb, model_lgb, val, feature_cols, w_xgb=0.5):
+    """计算 val 集上 ensemble 的 Rank IC 均值（用于动态权重计算）"""
+    if model_lgb is not None:
+        val_ens = ensemble_rank_avg(val, model_xgb, model_lgb, feature_cols, w_xgb=w_xgb)
+        return _quick_ic(val_ens, feature_cols)
+    else:
+        val2 = val.copy()
+        val2["pred"] = model_xgb.predict(val[feature_cols].values.astype(float))
+        return _quick_ic(val2, feature_cols)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1254,9 +1468,12 @@ def run_wfo_predictions(panel: pd.DataFrame,
 # 14. Main
 # ════════════════════════════════════════════════════════════════════════════
 def main():
+    import json
     t_total = time.time()
     print("=" * 60)
     print("  XGBoost 截面选股模型  |  预测 10 日超额收益")
+    print(f"  Train: {TRAIN_START}~{TRAIN_END}  Val: {VAL_START}~{VAL_END}")
+    print(f"  Test:  {TEST_START}~{END_DATE}  (严格 OOS，训练全程不可见)")
     print("=" * 60)
 
     conn = get_conn()
@@ -1274,7 +1491,6 @@ def main():
         # ── Step 3: RSI（向量化）────────────────────────────────────────
         print("\n[Step 3] 计算 RSI(14)")
         rsi_matrix = compute_rsi(close_pivot)
-        # 过滤到调仓日期
         rebal_set  = set(str(d) for d in rebal_dates)
         rsi_rebal  = rsi_matrix[rsi_matrix.index.isin(rebal_set)]
 
@@ -1285,14 +1501,12 @@ def main():
         # ── Step 5: 基本面 PIT ───────────────────────────────────────────
         print("\n[Step 5] 基本面 PIT 特征")
         fund_panel = load_fundamental_panel(conn)
-        # 调仓日 × 股票 keys（从 tech_df 中取）
         tech_rebal = tech_df[tech_df["trade_date"].isin(rebal_set)]
         rebal_keys = tech_rebal[["ts_code", "trade_date"]].drop_duplicates()
         fund_pit = join_fundamental_pit(fund_panel, rebal_keys)
 
         # ── Step 6: 分析师预期特征 ───────────────────────────────────────
         print("\n[Step 6] 分析师预期特征")
-        # 构建 (ts_code, trade_date) → total_mv(万元) 映射（用于 np_yield 归一化）
         mv_cols = tech_rebal[["ts_code", "trade_date", "total_mv_100m"]].copy()
         mv_map  = {(row["ts_code"], row["trade_date"]): row["total_mv_100m"] * 10000
                    for _, row in mv_cols.iterrows()}
@@ -1337,93 +1551,146 @@ def main():
     avail_features = [c for c in ALL_FEATURES if c in panel.columns]
     panel = preprocess_panel(panel, avail_features, neutralize=True)
 
-    # 删除特征缺失过多的行（超过 50% 特征为 NaN）
-    # 规则松弛: 1/3 → 1/2，holder_chg_qoq/gross_margin_chg_yoy 等季度特征
-    # 覆盖率天然 <100%，降低门槛避免过多丢弃行情有效股票
     feature_na_rate = panel[avail_features].isna().mean(axis=1)
     panel = panel[feature_na_rate < 0.50].copy()
 
-    # 填充剩余 NaN（用截面中位数，tree 模型对 NaN 有一定容忍度，但仍需填充）
     for col in avail_features:
         if col in panel.columns and panel[col].isna().any():
             panel[col] = panel.groupby("trade_date")[col].transform(
                 lambda x: x.fillna(x.median())
-            )
+            ).fillna(0)
 
     print(f"  最终Panel: {len(panel):,} 行, {panel['trade_date'].nunique()} 个截面")
 
-    # ── Step 10: 训练/测试分割 ────────────────────────────────────────────
-    print("\n[Step 10] Purged 训练/测试切分")
-    train, test = split_purged(panel)
+    # ── Step 10: 三段式严格切分 ───────────────────────────────────────────
+    print("\n[Step 10] 三段式数据切分 (Train / Val / Test)")
+    train, val, test = split_train_val_test(panel)
 
-    # ── Step 11: 训练 ─────────────────────────────────────────────────────
-    if WFO_MODE:
-        # WFO 模式：在 Step 12 中直接运行，此处先训一个基础模型供 plot_results 使用
-        xgb_model = train_xgb(train, avail_features)
-        lgb_model = train_lgbm(train, avail_features) if ENSEMBLE_LGB else None
-        model = xgb_model
+    # ── Step 11: 超参搜索（仅在 Val 上，不接触 Test）────────────────────
+    print("\n[Step 11] 超参数网格搜索（在 Val 上评估）")
+    best_params, hp_results = hyperparameter_search_xgb(train, val, avail_features)
+
+    # 保存 HP 搜索结果
+    os.makedirs(f"{OUTPUT_DIR}/csv", exist_ok=True)
+    hp_results.to_csv(f"{OUTPUT_DIR}/csv/xgb_hp_search_results.csv", index=False)
+    print(f"  HP搜索结果已保存: {OUTPUT_DIR}/csv/xgb_hp_search_results.csv")
+
+    # ── Step 12: 敏感性测试（验证参数稳健性）────────────────────────────
+    print("\n[Step 12] 参数敏感性测试")
+    sensitivity_test_xgb(train, val, avail_features, best_params)
+
+    # ── Step 13: 最终训练（train+val，不接触 Test）───────────────────────
+    print("\n[Step 13] 最终模型训练（train → ES → train+val 合并重训）")
+    xgb_model, xgb_train_only = train_xgb_final(train, val, avail_features, best_params)
+    if ENSEMBLE_LGB:
+        lgb_model, lgb_train_only = train_lgbm_final(train, val, avail_features, best_params)
     else:
-        xgb_model = train_xgb(train, avail_features)
-        lgb_model = train_lgbm(train, avail_features) if ENSEMBLE_LGB else None
-        model = xgb_model
+        lgb_model, lgb_train_only = None, None
+    model = xgb_model  # 用于 feature importance 和 plot
 
-    # ── Step 12: 评估 ─────────────────────────────────────────────────────
-    print("\n[Step 12] 评估")
-    if WFO_MODE:
-        # WFO：每段用该段起始前的数据重训，拼接全部测试期预测
-        wfo_panel = run_wfo_predictions(panel, avail_features)
-        # wfo_panel 来自 panel，已含 excess_ret/label；直接用，无需再 merge
-        wfo_with_label = wfo_panel.copy()
-        wfo_pred = wfo_with_label["pred"].values
-        test_res = evaluate(wfo_with_label, model, avail_features,
-                            label="TEST (WFO)", pred_arr=wfo_pred)
-        # 训练集仍用单次训练评估
-        if ENSEMBLE_LGB and lgb_model is not None:
-            train_ens = ensemble_rank_avg(train, xgb_model, lgb_model, avail_features)
-            train_res = evaluate(train_ens, model, avail_features, label="TRAIN",
-                                 pred_arr=train_ens["pred"].values)
-        else:
-            train_res = evaluate(train, model, avail_features, label="TRAIN")
-        # 同时打印静态 ensemble 作对比
-        print("\n  [参考] 静态 ensemble（非 WFO）:")
-        if ENSEMBLE_LGB and lgb_model is not None:
-            test_ens  = ensemble_rank_avg(test, xgb_model, lgb_model, avail_features)
-            evaluate(test_ens, model, avail_features, label="STATIC-ENS",
-                     pred_arr=test_ens["pred"].values)
-        else:
-            evaluate(test, model, avail_features, label="STATIC-XGB")
-    elif ENSEMBLE_LGB and lgb_model is not None:
-        # 静态 XGB+LGB ensemble
-        train_ens = ensemble_rank_avg(train, xgb_model, lgb_model, avail_features)
-        test_ens  = ensemble_rank_avg(test,  xgb_model, lgb_model, avail_features)
-        train_res = evaluate(train_ens, model, avail_features, label="TRAIN",
-                             pred_arr=train_ens["pred"].values)
-        test_res  = evaluate(test_ens,  model, avail_features, label="TEST",
-                             pred_arr=test_ens["pred"].values)
+    # ── 保存 Val 期预测（使用 train-only 模型，供策略超参搜索使用）──────
+    print("\n  保存 Val 期预测（train-only 模型，严格 PIT）...")
+    val_pred_df = val.copy()
+    if ENSEMBLE_LGB and lgb_train_only is not None:
+        # 使用 train-only 的动态权重（未知最终权重，先用 0.5）
+        val_to_ic, _ = quick_eval_xgb_on_val(train, val, avail_features, best_params)
+        val2_lgb = val.copy()
+        val2_lgb["pred"] = lgb_train_only.predict(val[avail_features].values.astype(float))
+        val_lgb_ic = _quick_ic(val2_lgb, avail_features)
+        tot = abs(val_to_ic) + abs(val_lgb_ic)
+        w_val = abs(val_to_ic) / tot if tot > 0 else 0.5
+        val_pred_df = ensemble_rank_avg(val_pred_df, xgb_train_only, lgb_train_only,
+                                        avail_features, w_xgb=w_val)
+    else:
+        val_pred_df["pred"] = xgb_train_only.predict(
+            val[avail_features].values.astype(float))
+    os.makedirs(f"{OUTPUT_DIR}/csv", exist_ok=True)
+    val_pred_df[["ts_code", "trade_date", "pred", "excess_ret"]].to_csv(
+        f"{OUTPUT_DIR}/csv/xgb_cs_pred_val.csv", index=False)
+    print(f"  Val预测已保存: {OUTPUT_DIR}/csv/xgb_cs_pred_val.csv  "
+          f"({len(val_pred_df):,}行, {val_pred_df['trade_date'].nunique()}个截面)")
+
+    # 计算动态 ensemble 权重（基于 val 集的 Rank IC，使用最终 train+val 模型评估）
+    w_xgb = 0.5
+    if ENSEMBLE_LGB and lgb_model is not None:
+        val_ic_xgb_only, _ = quick_eval_xgb_on_val(
+            pd.concat([train, val], ignore_index=True), val, avail_features, best_params)
+        val2 = val.copy()
+        val2["pred"] = lgb_model.predict(val[avail_features].values.astype(float))
+        val_ic_lgb = _quick_ic(val2, avail_features)
+        total = abs(val_ic_xgb_only) + abs(val_ic_lgb)
+        if total > 0:
+            w_xgb = abs(val_ic_xgb_only) / total
+        print(f"\n  动态 ensemble 权重: XGB={w_xgb:.3f}  LGB={1-w_xgb:.3f}  "
+              f"(val_IC: xgb={val_ic_xgb_only:+.4f}  lgb={val_ic_lgb:+.4f})")
+
+    # ── Step 14: 评估 ────────────────────────────────────────────────────
+    print("\n[Step 14] 评估（训练集 / Val / Test）")
+    train_val_all = pd.concat([train, val], ignore_index=True)
+
+    if ENSEMBLE_LGB and lgb_model is not None:
+        # Train+Val 评估（in-sample 参考）
+        tv_ens = ensemble_rank_avg(train_val_all, xgb_model, lgb_model,
+                                   avail_features, w_xgb=w_xgb)
+        train_res = evaluate(tv_ens, model, avail_features, label="TRAIN+VAL",
+                             pred_arr=tv_ens["pred"].values)
+
+        # Val 单独评估（已被 HP 搜索"见过"，仅作参考）
+        print("\n  [参考] Val 集（已用于 HP 选择，非独立 OOS）:")
+        val_ens = ensemble_rank_avg(val, xgb_model, lgb_model, avail_features, w_xgb=w_xgb)
+        val_res = evaluate(val_ens, model, avail_features, label="VAL (ref)",
+                           pred_arr=val_ens["pred"].values)
+
+        # Test 评估（唯一真实 OOS）
+        test_ens = ensemble_rank_avg(test, xgb_model, lgb_model, avail_features, w_xgb=w_xgb)
+        test_res = evaluate(test_ens, model, avail_features, label="TEST (OOS)",
+                            pred_arr=test_ens["pred"].values)
+
         print("\n  [参考] 纯 XGBoost（无 LGB ensemble）:")
         evaluate(test, model, avail_features, label="XGB-only")
     else:
-        train_res = evaluate(train, model, avail_features, label="TRAIN")
-        test_res  = evaluate(test,  model, avail_features, label="TEST")
+        train_res = evaluate(train_val_all, model, avail_features, label="TRAIN+VAL")
+        test_res  = evaluate(test,          model, avail_features, label="TEST (OOS)")
 
-    # ── Step 13: 可视化 & 保存 ────────────────────────────────────────────
-    print("\n[Step 13] 可视化 & 保存")
+    # ── Step 15: 可视化 & 保存 ────────────────────────────────────────────
+    print("\n[Step 15] 可视化 & 保存")
     plot_results(train_res, test_res, model, avail_features)
     save_predictions(test_res)
 
     # 保存特征重要性
-    os.makedirs(f"{OUTPUT_DIR}/csv", exist_ok=True)
     feat_imp_df = pd.DataFrame({
         "feature":    avail_features,
         "importance": model.feature_importances_,
     }).sort_values("importance", ascending=False)
     feat_imp_df.to_csv(f"{OUTPUT_DIR}/csv/xgb_feature_importance.csv", index=False)
 
+    # 保存模型到磁盘（供 infer_today.py 实盘推理使用）
+    models_dir = f"{OUTPUT_DIR}/models"
+    os.makedirs(models_dir, exist_ok=True)
+    xgb_model.save_model(f"{models_dir}/xgb_h{HORIZON}.json")
+    if ENSEMBLE_LGB and lgb_model is not None:
+        lgb_model.save_model(f"{models_dir}/lgb_h{HORIZON}.txt")
+        print(f"  模型已保存: {models_dir}/xgb_h{HORIZON}.json + lgb_h{HORIZON}.txt")
+    else:
+        print(f"  模型已保存: {models_dir}/xgb_h{HORIZON}.json")
+
+    with open(f"{models_dir}/features_h{HORIZON}.json", "w") as f:
+        json.dump({
+            "features":   avail_features,
+            "train_end":  TRAIN_END,
+            "val_end":    VAL_END,
+            "test_start": TEST_START,
+            "best_params": best_params,
+            "w_xgb":      w_xgb,
+        }, f, indent=2)
+
     elapsed = time.time() - t_total
     print(f"\n{'='*60}")
     print(f"  总耗时: {elapsed:.1f}s")
-    print(f"  训练集 ICIR={train_res['icir']:+.3f}  GAUC={train_res['gauc']:.4f}")
-    print(f"  测试集 ICIR={test_res['icir']:+.3f}  GAUC={test_res['gauc']:.4f}")
+    print(f"  最优超参: depth={best_params['max_depth']}  "
+          f"mcw={best_params['min_child_weight']}  λ={best_params['reg_lambda']:.1f}")
+    print(f"  Train+Val ICIR={train_res['icir']:+.3f}  GAUC={train_res['gauc']:.4f}")
+    print(f"  Test(OOS) ICIR={test_res['icir']:+.3f}  GAUC={test_res['gauc']:.4f}")
     print(f"{'='*60}")
 
 

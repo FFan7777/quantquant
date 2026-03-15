@@ -67,8 +67,8 @@ from data_collect.config import config
 # ══════════════════════════════════════════════════════════════════════
 
 DB_PATH        = config.db_path
-BACKTEST_START = '20230101'
-BACKTEST_END   = '20251231'
+BACKTEST_START = '20250801'
+BACKTEST_END   = '20260311'
 
 # 持仓槽位（权重 = 总净值 / MAX_SLOTS，固定不变）
 MAX_SLOTS     = 8
@@ -590,6 +590,9 @@ def run_backtest(
           f"cash_yield={RISK_FREE_RATE:.0%}  vol_scale={USE_VOL_SCALE}")
     pf = Portfolio(INITIAL_CAPITAL)
 
+    # 预计算涨跌幅（用于涨跌停过滤）
+    pct_chg_pv = price_pv.pct_change()
+
     cs_by_date: Dict[str, pd.DataFrame] = {
         dt: grp for dt, grp in cs_preds.groupby('trade_date')
     }
@@ -626,7 +629,8 @@ def run_backtest(
         # 熊市模式：止损收紧至 6%，MA 死叉检查仅需 BEAR_MIN_HOLD 天
         exits = daily_stop_check(pf, prices, ma5, ma20, date, bear_mode=bear_mode)
         for ts in exits:
-            p = float(prices.get(ts, pf.entry_price.get(ts, 1.0)) or 1.0)
+            p_raw = prices.get(ts, np.nan)
+            p = float(p_raw if pd.notna(p_raw) and p_raw > 0 else pf.entry_price.get(ts, 1.0))
             cash_rcv = pf.sell(ts, p, date)
             trade_log.append({
                 'date': date, 'ts_code': ts,
@@ -672,6 +676,12 @@ def run_backtest(
                         m20 = ma20.get(ts_code, np.nan)
                         return pd.notna(p) and pd.notna(m20) and m20 > 0 and p > m20
                     scores_df = scores_df[scores_df['ts_code'].apply(_above_ma20)]
+
+                # ── 涨停过滤：涨停股无法买入（市场实际无卖方）────────────
+                if date in pct_chg_pv.index:
+                    pct_today = pct_chg_pv.loc[date]
+                    limit_up_stocks = set(pct_today[pct_today >= 0.095].dropna().index)
+                    scores_df = scores_df[~scores_df['ts_code'].isin(limit_up_stocks)]
 
                 target_stocks = scores_df['ts_code'].tolist()
                 slot_confirmed = (consec_nonzero >= SLOT_CONFIRM_DAYS)
