@@ -1126,3 +1126,74 @@ class DataCollector:
                 status='failed',
                 error_message=str(e)
             )
+
+    def collect_holder_data(self, start_year: int = 2016, end_year: int = None):
+        """
+        按季度末批量收集股东户数 (stk_holdernumber) 并入库
+        约 40 次 API 请求，耗时几分钟
+        """
+        import duckdb as _duckdb
+        from tqdm import tqdm as _tqdm
+        import pandas as _pd
+        from datetime import datetime as _dt
+
+        if end_year is None:
+            end_year = _dt.now().year
+
+        CREATE_SQL = """
+        CREATE TABLE IF NOT EXISTS stk_holdernumber (
+            ts_code    VARCHAR NOT NULL,
+            ann_date   VARCHAR,
+            end_date   VARCHAR NOT NULL,
+            holder_num BIGINT,
+            PRIMARY KEY (ts_code, end_date)
+        )"""
+
+        db_path = self.db.db_path
+
+        with _duckdb.connect(db_path) as conn:
+            conn.execute(CREATE_SQL)
+            existing = set(conn.execute(
+                "SELECT DISTINCT end_date FROM stk_holdernumber"
+            ).fetchdf()["end_date"].tolist())
+
+        dates = []
+        for y in range(start_year, end_year + 1):
+            for mmdd in ["0331", "0630", "0930", "1231"]:
+                d = f"{y}{mmdd}"
+                if d <= _dt.now().strftime("%Y%m%d"):
+                    dates.append(d)
+        todo = [d for d in dates if d not in existing]
+        print(f"待收集季度: {len(todo)} 个（已有: {len(existing)} 个）")
+        if not todo:
+            print("stk_holdernumber 已是最新，无需收集")
+            return
+
+        total_rows = 0
+        with _duckdb.connect(db_path) as conn:
+            for end_date in _tqdm(todo, desc="收集股东户数（按季度）"):
+                try:
+                    df = self.api._retry_request(
+                        self.api.pro.stk_holdernumber,
+                        end_date=end_date,
+                        fields="ts_code,ann_date,end_date,holder_num"
+                    )
+                    if df is None or df.empty:
+                        continue
+                    df["holder_num"] = _pd.to_numeric(df["holder_num"], errors="coerce")
+                    df = df.dropna(subset=["ts_code", "end_date", "holder_num"])
+                    df["holder_num"] = df["holder_num"].astype(int)
+                    if not df.empty:
+                        conn.execute("INSERT OR REPLACE INTO stk_holdernumber SELECT * FROM df")
+                        total_rows += len(df)
+                except Exception as e:
+                    print(f"  [{end_date}] 失败: {e}")
+
+        print(f"完成！共入库 {total_rows:,} 条记录")
+        with _duckdb.connect(db_path, read_only=True) as conn:
+            r = conn.execute("""
+                SELECT COUNT(*) AS rows, COUNT(DISTINCT ts_code) AS stocks,
+                       MIN(end_date) AS min_date, MAX(end_date) AS max_date
+                FROM stk_holdernumber
+            """).fetchone()
+        print(f"  stk_holdernumber: {r[0]:,} 行, {r[1]} 只, {r[2]}~{r[3]}")

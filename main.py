@@ -13,6 +13,7 @@ A股数据收集主程序
     python main.py collect-report-rc      # 收集券商一致预期数据
     python main.py stats                  # 显示数据统计
     python main.py refetch-missing        # 重新获取遗漏数据
+    python main.py collect-holder         # 收集股东户数（按季度）
 """
 
 import argparse
@@ -153,19 +154,27 @@ def refetch_missing():
         refetcher.close()
 
 
+def collect_holder(start_year: int = 2016, end_year: int = None):
+    """收集股东户数（stk_holdernumber，按季度）"""
+    collector = DataCollector()
+    collector.collect_holder_data(start_year=start_year, end_year=end_year)
+
+
 def main():
     parser = argparse.ArgumentParser(description='A股数据收集工具')
     parser.add_argument('command', choices=[
         'init', 'collect-all', 'update', 'collect-stock',
         'collect-daily', 'collect-financial',
         'collect-moneyflow-fast', 'collect-report-rc',
-        'stats', 'refetch-missing'
+        'stats', 'refetch-missing', 'collect-holder'
     ], help='执行的命令')
     parser.add_argument('--start-date', help='开始日期 (YYYYMMDD)')
     parser.add_argument('--end-date', help='结束日期 (YYYYMMDD)')
     parser.add_argument('--incremental', action='store_true', help='增量更新模式')
     parser.add_argument('--no-resume', action='store_true', help='collect-moneyflow-fast: 不使用断点续传')
     parser.add_argument('--workers', type=int, default=5, help='collect-moneyflow-fast: 并发线程数 (默认: 5)')
+    parser.add_argument('--start-year', type=int, default=2016, help='collect-holder: 开始年份 (默认: 2016)')
+    parser.add_argument('--end-year',   type=int, default=None,  help='collect-holder: 结束年份 (默认: 当年)')
 
     args = parser.parse_args()
 
@@ -212,6 +221,9 @@ def main():
 
         elif args.command == 'refetch-missing':
             refetch_missing()
+
+        elif args.command == 'collect-holder':
+            collect_holder(start_year=args.start_year, end_year=args.end_year)
 
     except KeyboardInterrupt:
         print("\n\n用户中断操作")

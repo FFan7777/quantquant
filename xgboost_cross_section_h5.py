@@ -20,6 +20,12 @@ XGBoost 截面选股模型
 预处理: MAD去极值 → 行业/市值中性化(残差) → 截面Z-score标准化
 
 注意: 严格遵守PIT原则，基本面数据使用f_ann_date(第一披露日)
+
+Changelog:
+  2026-03-17  Fix data split leakage: TRAIN_END changed from 20250630 to 20211231,
+              aligned with xgboost_cross_section.py (H10, LONG_VAL=True).
+              Added two-stage training (train-only for val eval, final=train+val for inference).
+              Val predictions saved to xgb_cs_pred_val_h5.csv for strategy_hp_search.py.
 """
 
 import os
@@ -45,11 +51,14 @@ BENCHMARK     = "000300.SH"          # 沪深300
 HORIZON       = 5                    # 预测窗口（交易日）
 REBAL_FREQ    = 5                    # 调仓频率（交易日）
 DATA_START    = "20160101"           # 数据加载起点（含预热期）
-TRAIN_START   = "20180101"          # 训练集起点
-TRAIN_END     = "20250630"          # 训练集终点（最新数据，生产模型）
+TRAIN_START   = "20180101"           # 训练集起点
+# 与 xgboost_cross_section.py LONG_VAL=True 保持完全一致
+TRAIN_END     = "20211231"           # Train: 2018-2021（4年）
+VAL_START     = "20220201"           # Val: 2022-2024（3年，含20日隔离）
+VAL_END       = "20241231"
+TEST_START    = "20250201"           # Test: 2025+（VAL_END后+20交易日隔离）
+END_DATE      = "20260316"           # 数据终点（当前最新）
 EMBARGO_DAYS  = 20                   # 隔离期（交易日数）
-TEST_START    = "20250801"          # 测试集起点（含20日隔离，OOS：2025H2+）
-END_DATE      = "20260311"          # 数据终点
 MIN_MKTCAP    = 2.0                  # 最小市值过滤（亿元）[从5.0降至2.0，捕获更多小盘alpha]
 OUTPUT_DIR    = "output"
 
@@ -838,71 +847,95 @@ def preprocess_panel(panel: pd.DataFrame,
 # ════════════════════════════════════════════════════════════════════════════
 def split_purged(panel: pd.DataFrame) -> tuple:
     """
-    训练集: TRAIN_START ~ TRAIN_END
-    测试集: TEST_START ~ END_DATE（已包含 EMBARGO_DAYS 隔离）
+    Train: TRAIN_START ~ TRAIN_END  (2018-2021)
+    Val:   VAL_START   ~ VAL_END    (2022-2024，含20日隔离)
+    Test:  TEST_START  ~ END_DATE   (2025+，含20日隔离)
+    返回: (train, val, test)
     """
     panel["trade_date"] = panel["trade_date"].astype(str)
     train = panel[(panel["trade_date"] >= TRAIN_START) &
                   (panel["trade_date"] <= TRAIN_END)].copy()
+    val   = panel[(panel["trade_date"] >= VAL_START) &
+                  (panel["trade_date"] <= VAL_END)].copy()
     test  = panel[panel["trade_date"] >= TEST_START].copy()
     print(f"  训练集: {train['trade_date'].min()} ~ {train['trade_date'].max()}, "
           f"{len(train):,} 行, {train['trade_date'].nunique()} 个截面")
+    print(f"  验证集: {val['trade_date'].min()} ~ {val['trade_date'].max()}, "
+          f"{len(val):,} 行, {val['trade_date'].nunique()} 个截面")
     print(f"  测试集: {test['trade_date'].min()} ~ {test['trade_date'].max()}, "
           f"{len(test):,} 行, {test['trade_date'].nunique()} 个截面")
-    return train, test
+    return train, val, test
 
 
 # ════════════════════════════════════════════════════════════════════════════
 # 11. XGBoost 训练
 # ════════════════════════════════════════════════════════════════════════════
-def train_xgb(train: pd.DataFrame, feature_cols: list) -> xgb.XGBRegressor:
+def train_xgb(train: pd.DataFrame, feature_cols: list,
+              val: pd.DataFrame = None,
+              n_estimators: int = 2000) -> xgb.XGBRegressor:
     """
     训练 XGBoost 截面排序模型（回归形式，label = 截面百分位排名）。
-    验证集: 训练集最后 12 个月（含隔离期保护，不会泄露）。
-    超参: 强正则化以避免金融数据过拟合。
+    val: 用于 Early Stopping 的验证集（独立 DataFrame，不从 train 内部切分）。
     """
     print("\n[训练] XGBoost 模型...")
 
-    # 验证集：训练集最后一年（动态计算，适配任意 TRAIN_END）
-    train_dates = sorted(train["trade_date"].unique())
-    val_cutoff = (pd.to_datetime(TRAIN_END) - pd.DateOffset(years=1)).strftime("%Y%m%d")
-    tr_data = train[train["trade_date"] < val_cutoff]
-    val_data = train[train["trade_date"] >= val_cutoff]
-    print(f"  训练子集: {tr_data['trade_date'].min()} ~ {tr_data['trade_date'].max()}, "
-          f"{len(tr_data):,} 行")
-    print(f"  验证子集: {val_data['trade_date'].min()} ~ {val_data['trade_date'].max()}, "
-          f"{len(val_data):,} 行")
+    X_tr = train[feature_cols].values.astype(float)
+    y_tr = train["label"].values.astype(float)
 
-    X_tr  = tr_data[feature_cols].values.astype(float)
-    y_tr  = tr_data["label"].values.astype(float)
-    X_val = val_data[feature_cols].values.astype(float)
-    y_val = val_data["label"].values.astype(float)
+    if val is not None:
+        X_val = val[feature_cols].values.astype(float)
+        y_val = val["label"].values.astype(float)
+        print(f"  训练集: {train['trade_date'].min()} ~ {train['trade_date'].max()}, "
+              f"{len(train):,} 行")
+        print(f"  验证集(ES): {val['trade_date'].min()} ~ {val['trade_date'].max()}, "
+              f"{len(val):,} 行")
+        eval_set = [(X_val, y_val)]
+        early_stopping_rounds = 50
+    else:
+        eval_set = None
+        early_stopping_rounds = None
+        print(f"  训练集: {train['trade_date'].min()} ~ {train['trade_date'].max()}, "
+              f"{len(train):,} 行  (无 Early Stopping)")
 
     model = xgb.XGBRegressor(
         objective        = "reg:squarederror",
-        n_estimators     = 1000,
+        n_estimators     = n_estimators,
         max_depth        = 4,
         learning_rate    = 0.02,
         subsample        = 0.7,
         colsample_bytree = 0.7,
-        min_child_weight = 30,    # 金融数据：防止在少数样本上过拟合
-        reg_lambda       = 10.0,  # L2 正则化
-        reg_alpha        = 0.5,   # L1 正则化（稀疏特征选择）
+        min_child_weight = 30,
+        reg_lambda       = 10.0,
+        reg_alpha        = 0.5,
         random_state     = 42,
         n_jobs           = -1,
         tree_method      = "hist",
-        early_stopping_rounds = 50,
+        early_stopping_rounds = early_stopping_rounds,
         eval_metric      = "rmse",
         verbosity        = 0,
     )
-    model.fit(
-        X_tr, y_tr,
-        eval_set=[(X_val, y_val)],
-        verbose=100,
-    )
-    best_iter = model.best_iteration
-    print(f"  最优迭代: {best_iter} 轮")
+    model.fit(X_tr, y_tr, eval_set=eval_set, verbose=100)
+    if val is not None:
+        print(f"  最优迭代: {model.best_iteration} 轮")
+    else:
+        print(f"  训练完成: {n_estimators} 轮（固定，无 ES）")
     return model
+
+
+def train_xgb_final(train: pd.DataFrame, val: pd.DataFrame,
+                    feature_cols: list) -> tuple:
+    """
+    两阶段最终训练，返回 (model_final, model_train_only)：
+    1. train-only 模型：在 train 上训练，用 val 做 ES → 供 val 期预测（PIT 正确）
+    2. final 模型：在 train+val 合并数据上用相同轮数重训（无 ES） → 供推理使用
+    """
+    model_train_only = train_xgb(train, feature_cols, val=val, n_estimators=2000)
+    best_n = model_train_only.best_iteration
+
+    train_val = pd.concat([train, val], ignore_index=True)
+    print(f"\n[训练 Final] train+val 合并，固定 {best_n} 轮（无 ES）...")
+    model_final = train_xgb(train_val, feature_cols, val=None, n_estimators=best_n)
+    return model_final, model_train_only
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1186,45 +1219,61 @@ def main():
 
     print(f"  最终Panel: {len(panel):,} 行, {panel['trade_date'].nunique()} 个截面")
 
-    # ── Step 10: 训练/测试分割 ────────────────────────────────────────────
-    print("\n[Step 10] Purged 训练/测试切分")
-    train, test = split_purged(panel)
+    # ── Step 10: 训练/验证/测试分割 ──────────────────────────────────────
+    print("\n[Step 10] Purged Train/Val/Test 切分")
+    train, val, test = split_purged(panel)
 
-    # ── Step 11: 训练 ─────────────────────────────────────────────────────
-    model = train_xgb(train, avail_features)
+    # ── Step 11: 两阶段训练 ───────────────────────────────────────────────
+    # model_train_only: 仅用 train(2018-2021) 训练 → 生成 val 期预测（PIT 正确）
+    # model_final:      train+val(2018-2024) 合并训练 → 供 2025+ 推理使用
+    print("\n[Step 11] 两阶段训练（train-only + final）")
+    model_final, model_train_only = train_xgb_final(train, val, avail_features)
 
     # ── Step 12: 评估 ─────────────────────────────────────────────────────
     print("\n[Step 12] 评估")
-    train_res = evaluate(train, model, avail_features, label="TRAIN")
-    test_res  = evaluate(test,  model, avail_features, label="TEST")
+    train_res = evaluate(train, model_train_only, avail_features, label="TRAIN(train-only)")
+    val_res   = evaluate(val,   model_train_only, avail_features, label="VAL(train-only)")
+    test_res  = evaluate(test,  model_final,      avail_features, label="TEST(final)")
 
     # ── Step 13: 可视化 & 保存 ────────────────────────────────────────────
     print("\n[Step 13] 可视化 & 保存")
-    plot_results(train_res, test_res, model, avail_features)
-    save_predictions(test_res)
+    plot_results(train_res, test_res, model_final, avail_features)
+    save_predictions(test_res)   # → xgb_cs_pred_h5.csv（test 期，供回测/实盘）
+
+    # 保存 Val 期预测（供 strategy_hp_search.py 使用）
+    os.makedirs(f"{OUTPUT_DIR}/csv", exist_ok=True)
+    val_pred_df = val.copy()
+    val_pred_df["pred"] = model_train_only.predict(
+        val[avail_features].values.astype(float)
+    )
+    val_pred_df[["ts_code", "trade_date", "pred", "excess_ret"]].to_csv(
+        f"{OUTPUT_DIR}/csv/xgb_cs_pred_val_h5.csv", index=False
+    )
+    print(f"  Val预测已保存: {OUTPUT_DIR}/csv/xgb_cs_pred_val_h5.csv  "
+          f"({len(val_pred_df):,}行, {val_pred_df['trade_date'].nunique()}个截面)")
 
     # 保存特征重要性
-    os.makedirs(f"{OUTPUT_DIR}/csv", exist_ok=True)
     feat_imp_df = pd.DataFrame({
         "feature":    avail_features,
-        "importance": model.feature_importances_,
+        "importance": model_final.feature_importances_,
     }).sort_values("importance", ascending=False)
-    feat_imp_df.to_csv(f"{OUTPUT_DIR}/csv/xgb_feature_importance.csv", index=False)
+    feat_imp_df.to_csv(f"{OUTPUT_DIR}/csv/xgb_feature_importance_h5.csv", index=False)
 
-    # 保存模型到磁盘（供 infer_today.py 实盘推理使用）
+    # 保存 final 模型（供 infer_today.py 实盘推理使用）
     import json
     models_dir = f"{OUTPUT_DIR}/models"
     os.makedirs(models_dir, exist_ok=True)
-    model.save_model(f"{models_dir}/xgb_h{HORIZON}.json")
+    model_final.save_model(f"{models_dir}/xgb_h{HORIZON}.json")
     with open(f"{models_dir}/features_h{HORIZON}.json", "w") as f:
-        json.dump({"features": avail_features, "train_end": TRAIN_END}, f, indent=2)
-    print(f"  模型已保存: {models_dir}/xgb_h{HORIZON}.json")
+        json.dump({"features": avail_features, "train_end": VAL_END}, f, indent=2)
+    print(f"  模型已保存: {models_dir}/xgb_h{HORIZON}.json  (final: train+val 2018-2024)")
 
     elapsed = time.time() - t_total
     print(f"\n{'='*60}")
     print(f"  总耗时: {elapsed:.1f}s")
-    print(f"  训练集 ICIR={train_res['icir']:+.3f}  GAUC={train_res['gauc']:.4f}")
-    print(f"  测试集 ICIR={test_res['icir']:+.3f}  GAUC={test_res['gauc']:.4f}")
+    print(f"  Train  ICIR={train_res['icir']:+.3f}  GAUC={train_res['gauc']:.4f}")
+    print(f"  Val    ICIR={val_res['icir']:+.3f}  GAUC={val_res['gauc']:.4f}")
+    print(f"  Test   ICIR={test_res['icir']:+.3f}  GAUC={test_res['gauc']:.4f}")
     print(f"{'='*60}")
 
 

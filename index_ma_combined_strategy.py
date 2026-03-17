@@ -67,25 +67,35 @@ from data_collect.config import config
 # ══════════════════════════════════════════════════════════════════════
 
 DB_PATH        = config.db_path
-BACKTEST_START = '20250801'
-BACKTEST_END   = '20260311'
+BACKTEST_START = '20250210'   # H10+H5 test predictions start from 20250210
+BACKTEST_END   = '20260316'
 
 # 持仓槽位（权重 = 总净值 / MAX_SLOTS，固定不变）
-MAX_SLOTS     = 8
-HALF_SLOTS    = 3
+MAX_SLOTS     = 8      # 满仓最大持股（Val Minimax 最优）
+HALF_SLOTS    = 2      # 半仓最大持股（Val Minimax 最优，之前3）
 BEAR_SLOTS    = 0    # 熊市（slots=0）时不主动调仓（=0禁用），持仓由风控自然退出
 
 # 个股风控参数
-MIN_HOLD_DAYS     = 5      # 最短持有期（交易日），达到后才允许 MA 死叉退出
-MA_DEATH_DAYS     = 5      # MA5 < MA20 连续多少天触发死叉退出
-STOP_LOSS_ENTRY   = 0.08   # 距入场价回撤 8% → 硬止损
+STOP_LOSS_ENTRY   = 0.10   # 距入场价回撤 10% → 硬止损（Val Minimax 最优）
 TRAILING_STOP     = 1.00   # 追踪止损（禁用，依靠 MA 死叉 + 硬止损退出）
 TAKE_PROFIT_GAIN  = 1.00   # 止盈追踪（禁用）
 TAKE_PROFIT_TRAIL = 0.10   # 止盈追踪幅度（禁用时无效）
 
-# 熊市强化参数（slots=0 时生效）
-BEAR_STOP_LOSS    = 0.08   # 熊市止损同普通
-BEAR_MIN_HOLD     = 5      # 熊市 MA 死叉同 MIN_HOLD_DAYS
+# ── Regime-Switching 退出参数（根据大盘 slots 动态切换）────────────────────
+# 牛市（slots=20）：放宽退出，顺势让利润奔跑
+# 调优结果（Val 2022-2024 Minimax）: bull(5,5) neutral(3,5) bear(2,2)
+BULL_MA_DEATH    = 5       # MA5<MA20 连续5天才退出（容忍短期回调）
+BULL_MIN_HOLD    = 5       # 至少持有5天才检查死叉
+# 中性（slots=10）：均衡参数
+NEUTRAL_MA_DEATH = 3       # 中性市场：3天死叉即检查
+NEUTRAL_MIN_HOLD = 5       # 至少持有5天
+# 熊市/空仓（slots=0）：快速退出，控制损失
+BEAR_MA_DEATH    = 2       # MA5<MA20 连续2天即退出（快速减损）
+BEAR_MIN_HOLD    = 2       # 至少持有2天即可检查死叉
+BEAR_STOP_LOSS   = 0.10    # 熊市止损幅度（与普通一致，10%）
+# 兼容旧代码的别名（中性 regime 默认值）
+MIN_HOLD_DAYS    = NEUTRAL_MIN_HOLD
+MA_DEATH_DAYS    = NEUTRAL_MA_DEATH
 
 # 优化开关
 BEAR_FAST_EXIT       = False # 不强制清仓；依靠 MA 死叉 + 硬止损自然退出
@@ -408,23 +418,33 @@ def daily_stop_check(
     ma5: pd.Series,
     ma20: pd.Series,
     date: str,
-    bear_mode: bool = False,
+    slots_today: int = 10,
 ) -> List[str]:
     """
     检查每只持仓的退出条件，返回需卖出的 ts_code 列表。
 
     退出顺序（优先级从高到低）：
       ① 停牌/退市（val ≤ 0）
-      ② 硬止损：price < entry_price × (1 - 止损幅度)
-           bear_mode=True → 6%（收紧）；普通 → 8%
-      ③ 追踪止损：price < peak × (1 - 止损幅度)
-           浮盈 ≥ TAKE_PROFIT_GAIN → 幅度 = TAKE_PROFIT_TRAIL（收紧）
-           否则 → TRAILING_STOP
-      ④ MA 死叉：MA5 < MA20 连续 MA_DEATH_DAYS 天
-           bear_mode → 持仓满 BEAR_MIN_HOLD 天；普通 → MIN_HOLD_DAYS
+      ② 硬止损：price < entry_price × (1 - effective_stop)
+      ③ 追踪止损：price < peak × (1 - TRAILING_STOP)（默认禁用）
+      ④ MA 死叉：MA5 < MA20 连续 N 天（N 由 Regime/slots 决定）
+           slots=20 → BULL_MA_DEATH  / BULL_MIN_HOLD   （顺势持仓）
+           slots=10 → NEUTRAL_MA_DEATH / NEUTRAL_MIN_HOLD（均衡）
+           slots=0  → BEAR_MA_DEATH  / BEAR_MIN_HOLD   （快速退出）
     """
-    effective_stop     = BEAR_STOP_LOSS if bear_mode else STOP_LOSS_ENTRY
-    effective_min_hold = BEAR_MIN_HOLD  if bear_mode else MIN_HOLD_DAYS
+    # Regime-switching：根据大盘 slots 选择退出参数
+    if slots_today == 20:
+        effective_ma_death = BULL_MA_DEATH
+        effective_min_hold = BULL_MIN_HOLD
+        effective_stop     = STOP_LOSS_ENTRY
+    elif slots_today == 10:
+        effective_ma_death = NEUTRAL_MA_DEATH
+        effective_min_hold = NEUTRAL_MIN_HOLD
+        effective_stop     = STOP_LOSS_ENTRY
+    else:  # slots=0，熊市
+        effective_ma_death = BEAR_MA_DEATH
+        effective_min_hold = BEAR_MIN_HOLD
+        effective_stop     = BEAR_STOP_LOSS
 
     to_sell = []
     for ts in list(portfolio.shares):
@@ -463,7 +483,7 @@ def daily_stop_check(
             if pd.notna(m5) and pd.notna(m20):
                 if m5 < m20:
                     portfolio.dc_count[ts] = portfolio.dc_count.get(ts, 0) + 1
-                    if portfolio.dc_count[ts] >= MA_DEATH_DAYS:
+                    if portfolio.dc_count[ts] >= effective_ma_death:
                         to_sell.append(ts)
                         continue
                 else:
@@ -584,10 +604,11 @@ def run_backtest(
       4. 执行调仓
     """
     print("\n[回测] 运行指数择时 + 截面选股联合策略...")
-    print(f"  优化: bear_fast_exit={BEAR_FAST_EXIT}  "
-          f"slot_confirm={SLOT_CONFIRM_DAYS}d  "
-          f"ma20_filter={ENTRY_MA20_FILTER}  min_hold={MIN_HOLD_DAYS}d  "
-          f"cash_yield={RISK_FREE_RATE:.0%}  vol_scale={USE_VOL_SCALE}")
+    print(f"  Regime退出: bull(md={BULL_MA_DEATH},mh={BULL_MIN_HOLD}) "
+          f"neutral(md={NEUTRAL_MA_DEATH},mh={NEUTRAL_MIN_HOLD}) "
+          f"bear(md={BEAR_MA_DEATH},mh={BEAR_MIN_HOLD})  "
+          f"stop={STOP_LOSS_ENTRY:.0%}  slot_confirm={SLOT_CONFIRM_DAYS}d  "
+          f"vol_scale={USE_VOL_SCALE}")
     pf = Portfolio(INITIAL_CAPITAL)
 
     # 预计算涨跌幅（用于涨跌停过滤）
@@ -627,7 +648,7 @@ def run_backtest(
 
         # ── ① 每日风控：止损 / 追踪止损 / MA 死叉 ────────────────────────
         # 熊市模式：止损收紧至 6%，MA 死叉检查仅需 BEAR_MIN_HOLD 天
-        exits = daily_stop_check(pf, prices, ma5, ma20, date, bear_mode=bear_mode)
+        exits = daily_stop_check(pf, prices, ma5, ma20, date, slots_today=slots_today)
         for ts in exits:
             p_raw = prices.get(ts, np.nan)
             p = float(p_raw if pd.notna(p_raw) and p_raw > 0 else pf.entry_price.get(ts, 1.0))
