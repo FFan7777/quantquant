@@ -1118,9 +1118,56 @@ def save_predictions(test_res: dict):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 14. Main
+# 14. 生产模型训练（--prod 模式）
+# ════════════════════════════════════════════════════════════════════════════
+def _run_prod_mode(panel: pd.DataFrame, avail_features: list):
+    """
+    训练 H5 生产模型：使用 2018-2025-12-31 全量数据，n_estimators 与 eval 模型一致。
+    输出: xgb_h5_prod.json, features_h5_prod.json
+    """
+    import json
+    PROD_END = "20251231"
+    prod_train = panel[panel["trade_date"] <= PROD_END].copy()
+    print(f"\n{'='*60}")
+    print(f"  [PROD] H{HORIZON} 生产模型训练")
+    print(f"  训练数据: {prod_train['trade_date'].min()} ~ {PROD_END}")
+    print(f"  {len(prod_train):,} 行, {prod_train['trade_date'].nunique()} 个截面")
+    print(f"{'='*60}")
+
+    models_dir = f"{OUTPUT_DIR}/models"
+    os.makedirs(models_dir, exist_ok=True)
+
+    # 从 eval 模型读取 n_estimators
+    eval_xgb = f"{models_dir}/xgb_h{HORIZON}.json"
+    if os.path.exists(eval_xgb):
+        _tmp = xgb.XGBRegressor(); _tmp.load_model(eval_xgb)
+        n_xgb = _tmp.get_booster().num_boosted_rounds()
+        print(f"  n_estimators = {n_xgb} (from eval model)")
+    else:
+        n_xgb = 400
+        print(f"  警告: 未找到 eval 模型，n_estimators={n_xgb}")
+
+    # 训练
+    model_prod = train_xgb(prod_train, avail_features, val=None, n_estimators=n_xgb)
+    model_prod.save_model(f"{models_dir}/xgb_h{HORIZON}_prod.json")
+
+    with open(f"{models_dir}/features_h{HORIZON}_prod.json", "w") as f:
+        json.dump({"features": avail_features, "train_end": PROD_END}, f, indent=2)
+
+    print(f"  生产模型已保存: xgb_h{HORIZON}_prod.json, features_h{HORIZON}_prod.json")
+    print(f"\n[PROD] H{HORIZON} 生产模型训练完成。")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 15. Main
 # ════════════════════════════════════════════════════════════════════════════
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description='XGBoost H5 截面选股模型')
+    parser.add_argument('--prod', action='store_true',
+                        help='生产模式：使用 2018-2025 全量数据训练，输出 *_prod 模型文件')
+    args = parser.parse_args()
+
     t_total = time.time()
     print("=" * 60)
     print("  XGBoost 截面选股模型  |  预测 10 日超额收益")
@@ -1218,6 +1265,11 @@ def main():
             ).fillna(0)  # 兜底：整个截面全为 NaN 时 median 仍为 NaN，用 0 填充
 
     print(f"  最终Panel: {len(panel):,} 行, {panel['trade_date'].nunique()} 个截面")
+
+    # ── 生产模式：跳过 eval 流程，直接训练全量生产模型 ──────────────────────
+    if args.prod:
+        _run_prod_mode(panel, avail_features)
+        return
 
     # ── Step 10: 训练/验证/测试分割 ──────────────────────────────────────
     print("\n[Step 10] Purged Train/Val/Test 切分")

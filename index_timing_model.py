@@ -69,6 +69,7 @@ class Config:
     val_end: str     = "20221231"     # 验证集结束
     test_start: str  = "20230201"     # 测试集起点（含 20 日隔离期）
     end_date: str    = "20260311"
+    pred_suffix: str = ""             # 预测文件后缀（prod 模式下设为 "_prod"）
 
     # 标签
     rebal_freq: int = 15              # 前向持有期（交易日），与选股模型对齐
@@ -1089,7 +1090,7 @@ def save_predictions(
         panel[['label', 'fwd_ret']].reset_index().rename(columns={'index': 'trade_date'}),
         on='trade_date', how='left',
     )
-    path = os.path.join(cfg.output_dir, 'csv', 'index_timing_predictions.csv')
+    path = os.path.join(cfg.output_dir, 'csv', f'index_timing_predictions{cfg.pred_suffix}.csv')
     out.to_csv(path, index=False)
     print(f"  预测结果已保存: {path} ({len(out)} 行)")
 
@@ -1130,24 +1131,48 @@ def main():
     parser.add_argument('--val_year',       type=int,   default=2022,
                         help='验证集年份（默认2022）。meta_label建议用非熊市年如2021，'
                              '因2022熊市导致MA活跃样本仅79个，val_AUC极不稳定。')
+    parser.add_argument('--prod',           action='store_true',
+                        help='生产模式：使用 2016-2025 全量数据训练，预测存至 '
+                             'index_timing_predictions_prod.csv，跳过 test 评估')
     args = parser.parse_args()
 
-    cfg = Config(
-        rebal_freq      = args.rebal_freq,
-        threshold_full  = args.threshold_full,
-        threshold_half  = args.threshold_half,
-        slots_full      = args.slots_full,
-        slots_half      = args.slots_half,
-        use_rolling_pct = args.use_rolling_pct,
-        pct_full        = args.pct_full,
-        pct_half        = args.pct_half,
-        label_type      = args.label_type,
-        n_estimators    = args.n_estimators,
-        max_depth       = args.max_depth,
-        ma_override     = args.ma_override,
-        val_cutoff      = f"{args.val_year}0101",
-        val_end         = f"{args.val_year}1231",
-    )
+    # 生产模式：使用 2025 年数据作为 ES val，其余全作为训练，跳过 test 评估
+    if args.prod:
+        cfg = Config(
+            rebal_freq      = args.rebal_freq,
+            threshold_full  = args.threshold_full,
+            threshold_half  = args.threshold_half,
+            slots_full      = args.slots_full,
+            slots_half      = args.slots_half,
+            use_rolling_pct = args.use_rolling_pct,
+            pct_full        = args.pct_full,
+            pct_half        = args.pct_half,
+            label_type      = args.label_type,
+            n_estimators    = args.n_estimators,
+            max_depth       = args.max_depth,
+            ma_override     = args.ma_override,
+            val_cutoff      = "20250101",   # 2025 作为 ES val
+            val_end         = "20251231",
+            test_start      = "20270101",   # 超出数据范围 → 跳过 test 评估
+            pred_suffix     = "_prod",
+        )
+    else:
+        cfg = Config(
+            rebal_freq      = args.rebal_freq,
+            threshold_full  = args.threshold_full,
+            threshold_half  = args.threshold_half,
+            slots_full      = args.slots_full,
+            slots_half      = args.slots_half,
+            use_rolling_pct = args.use_rolling_pct,
+            pct_full        = args.pct_full,
+            pct_half        = args.pct_half,
+            label_type      = args.label_type,
+            n_estimators    = args.n_estimators,
+            max_depth       = args.max_depth,
+            ma_override     = args.ma_override,
+            val_cutoff      = f"{args.val_year}0101",
+            val_end         = f"{args.val_year}1231",
+        )
 
     print("=" * 65)
     print("沪深300指数择时模型")

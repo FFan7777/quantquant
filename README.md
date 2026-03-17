@@ -43,6 +43,18 @@ Regime-Switching 退出参数
     ↓                          根据当前 slots 动态调整 MA死叉/止损阈值
 ```
 
+### 数据划分
+
+| 模块 | Train | Val（调参/ES） | Test（OOS） |
+|------|-------|----------------|-------------|
+| CS 模型 H10（xgboost_cross_section.py） | 2018–2021 | 2022–2024 | **2025-02+** |
+| CS 模型 H5（xgboost_cross_section_h5.py） | 2018–2021 | 2022–2024 | **2025-02+** |
+| 指数择时（index_timing_model.py） | 2016–2022 | 2022（内嵌 ES） | **2023-02+** |
+| 策略 HP Search（strategy_hp_search.py） | — | 2022-02–2024-12 | **2025-02+** |
+| 主策略回测（index_ma_combined_strategy.py） | — | — | **2025-02–今** |
+
+> 主策略回测覆盖 2025-02 起，为 CS 模型与 HP Search 三者 Test 期的交集，是唯一真实 OOS 评测区间。
+
 ### 关键参数（HP Search v2 最优）
 
 | 参数 | 值 | 说明 |

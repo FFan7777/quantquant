@@ -1473,10 +1473,92 @@ def run_wfo_predictions(panel: pd.DataFrame,
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 14. Main
+# 14. 生产模型训练（--prod 模式）
+# ════════════════════════════════════════════════════════════════════════════
+def _run_prod_mode(panel: pd.DataFrame, avail_features: list):
+    """
+    训练生产模型：使用 2018-2025-12-31 全量数据，超参与 eval 模型保持一致。
+    输出: xgb_h{HORIZON}_prod.json, lgb_h{HORIZON}_prod.txt (若 ENSEMBLE_LGB),
+          features_h{HORIZON}_prod.json
+    """
+    import json
+    PROD_END = "20251231"
+    prod_train = panel[panel["trade_date"] <= PROD_END].copy()
+    print(f"\n{'='*60}")
+    print(f"  [PROD] H{HORIZON} 生产模型训练")
+    print(f"  训练数据: {prod_train['trade_date'].min()} ~ {PROD_END}")
+    print(f"  {len(prod_train):,} 行, {prod_train['trade_date'].nunique()} 个截面")
+    print(f"{'='*60}")
+
+    models_dir = f"{OUTPUT_DIR}/models"
+    os.makedirs(models_dir, exist_ok=True)
+
+    # 从 eval 元数据读取 best_params 和 w_xgb
+    feat_path = f"{models_dir}/features_h{HORIZON}.json"
+    if os.path.exists(feat_path):
+        with open(feat_path) as f:
+            meta = json.load(f)
+        best_params = meta.get("best_params", _DEFAULT_XGB_PARAMS)
+        w_xgb       = meta.get("w_xgb", 0.5)
+        print(f"  超参 (from eval): depth={best_params.get('max_depth')}  "
+              f"mcw={best_params.get('min_child_weight')}  "
+              f"λ={best_params.get('reg_lambda')}  w_xgb={w_xgb:.3f}")
+    else:
+        best_params, w_xgb = _DEFAULT_XGB_PARAMS, 0.5
+        print("  警告: 未找到 eval 元数据，使用默认超参")
+
+    # 从 eval XGB 模型读取 n_estimators
+    eval_xgb = f"{models_dir}/xgb_h{HORIZON}.json"
+    if os.path.exists(eval_xgb):
+        _tmp = xgb.XGBRegressor(); _tmp.load_model(eval_xgb)
+        n_xgb = _tmp.get_booster().num_boosted_rounds()
+        print(f"  XGB n_estimators = {n_xgb} (from eval model)")
+    else:
+        n_xgb = 500
+        print(f"  警告: 未找到 eval XGB 模型，n_estimators={n_xgb}")
+
+    # 训练 XGB 生产模型
+    xgb_prod = train_xgb(prod_train, avail_features, val=None,
+                         params=best_params, n_estimators=n_xgb)
+    xgb_prod.save_model(f"{models_dir}/xgb_h{HORIZON}_prod.json")
+    print(f"  XGB 生产模型已保存: xgb_h{HORIZON}_prod.json")
+
+    # 训练 LGB 生产模型（若启用 ensemble）
+    lgb_prod = None
+    if ENSEMBLE_LGB:
+        eval_lgb = f"{models_dir}/lgb_h{HORIZON}.txt"
+        if os.path.exists(eval_lgb):
+            n_lgb = lgb.Booster(model_file=eval_lgb).num_trees()
+            print(f"  LGB n_estimators = {n_lgb} (from eval model)")
+        else:
+            n_lgb = n_xgb
+        lgb_prod = train_lgbm(prod_train, avail_features, val=None,
+                              params=best_params, n_estimators=n_lgb)
+        lgb_prod.save_model(f"{models_dir}/lgb_h{HORIZON}_prod.txt")
+        print(f"  LGB 生产模型已保存: lgb_h{HORIZON}_prod.txt")
+
+    # 保存特征元数据
+    with open(f"{models_dir}/features_h{HORIZON}_prod.json", "w") as f:
+        json.dump({
+            "features":   avail_features,
+            "train_end":  PROD_END,
+            "best_params": best_params,
+            "w_xgb":      w_xgb,
+        }, f, indent=2)
+    print(f"  元数据已保存: features_h{HORIZON}_prod.json")
+    print(f"\n[PROD] H{HORIZON} 生产模型训练完成。")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 15. Main
 # ════════════════════════════════════════════════════════════════════════════
 def main():
-    import json
+    import argparse, json
+    parser = argparse.ArgumentParser(description='XGBoost 截面选股模型')
+    parser.add_argument('--prod', action='store_true',
+                        help='生产模式：使用 2018-2025 全量数据训练，输出 *_prod 模型文件')
+    args = parser.parse_args()
+
     t_total = time.time()
     print("=" * 60)
     print("  XGBoost 截面选股模型  |  预测 10 日超额收益")
@@ -1569,6 +1651,11 @@ def main():
             ).fillna(0)
 
     print(f"  最终Panel: {len(panel):,} 行, {panel['trade_date'].nunique()} 个截面")
+
+    # ── 生产模式：跳过 eval 流程，直接训练全量生产模型 ──────────────────────
+    if args.prod:
+        _run_prod_mode(panel, avail_features)
+        return
 
     # ── Step 10: 三段式严格切分 ───────────────────────────────────────────
     print("\n[Step 10] 三段式数据切分 (Train / Val / Test)")

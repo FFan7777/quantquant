@@ -39,7 +39,18 @@ warnings.filterwarnings("ignore")
 ROOT       = Path(__file__).parent
 DB_PATH    = str(ROOT / "data" / "quant.duckdb")
 MODELS_DIR = ROOT / "output" / "models"
-INDEX_TIMING_FILE = ROOT / "output" / "csv" / "index_timing_predictions.csv"
+
+# 优先使用生产模型（_prod），回退到 eval 模型
+def _prod_or(name: str) -> Path:
+    """返回 _prod 版本路径（若存在），否则返回原始路径。"""
+    p = MODELS_DIR / name
+    stem, suffix = name.rsplit(".", 1) if "." in name else (name, "")
+    prod = MODELS_DIR / f"{stem}_prod.{suffix}"
+    return prod if prod.exists() else p
+
+_timing_prod = ROOT / "output" / "csv" / "index_timing_predictions_prod.csv"
+_timing_eval = ROOT / "output" / "csv" / "index_timing_predictions.csv"
+INDEX_TIMING_FILE = _timing_prod if _timing_prod.exists() else _timing_eval
 
 # ── 策略参数（与回测保持一致）───────────────────────────────────────────────
 MAX_SLOTS       = 8
@@ -84,27 +95,30 @@ def load_models():
     features = {}
 
     for hz in [10, 5]:
-        xgb_path = MODELS_DIR / f"xgb_h{hz}.json"
-        feat_path = MODELS_DIR / f"features_h{hz}.json"
+        xgb_path  = _prod_or(f"xgb_h{hz}.json")
+        feat_path = _prod_or(f"features_h{hz}.json")
+        is_prod   = "_prod" in xgb_path.name
         if not xgb_path.exists():
             print(f"  ⚠ 未找到模型: {xgb_path}")
-            print(f"    请先运行: python xgboost_cross_section{'_h5' if hz==5 else ''}.py")
+            print(f"    请先运行: python xgboost_cross_section{'_h5' if hz==5 else ''}.py [--prod]")
             continue
         m = xgb.XGBRegressor()
         m.load_model(str(xgb_path))
         models[f"xgb_h{hz}"] = m
+        tag = "[PROD]" if is_prod else "[eval]"
         if feat_path.exists():
             with open(feat_path) as f:
                 meta = json.load(f)
             features[f"h{hz}"] = meta.get("features", ALL_FEATURES)
-            print(f"  ✓ xgb_h{hz} 加载（训练截止 {meta.get('train_end', '?')}）")
+            print(f"  ✓ xgb_h{hz} {tag} 加载（训练截止 {meta.get('train_end', '?')}）")
         else:
             features[f"h{hz}"] = ALL_FEATURES
 
-        lgb_path = MODELS_DIR / f"lgb_h{hz}.txt"
+        lgb_path = _prod_or(f"lgb_h{hz}.txt")
         if lgb_path.exists():
             models[f"lgb_h{hz}"] = lgb.Booster(model_file=str(lgb_path))
-            print(f"  ✓ lgb_h{hz} 加载")
+            lgb_tag = "[PROD]" if "_prod" in lgb_path.name else "[eval]"
+            print(f"  ✓ lgb_h{hz} {lgb_tag} 加载")
 
     return models, features
 
@@ -524,7 +538,7 @@ def get_timing_slots(infer_date: str):
     """从已生成的 CSV 读取指数择时 slots"""
     if not INDEX_TIMING_FILE.exists():
         print(f"  ⚠ 择时文件不存在: {INDEX_TIMING_FILE}")
-        print(f"    请先运行: python index_timing_model.py --label_type ma60_state --no_wfo")
+        print(f"    请先运行: python index_timing_model.py --label_type ma60_state --no_wfo [--prod]")
         return None, "未知（缺少择时文件）"
 
     df = pd.read_csv(INDEX_TIMING_FILE, dtype={"trade_date": str})
