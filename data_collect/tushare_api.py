@@ -377,6 +377,44 @@ class TushareAPI:
             fields=','.join(fields)
         )
 
+    # ── 批量按日期接口（增量更新专用，1次API调用取全市场）──────────────────────
+
+    def get_daily_by_date(self, trade_date: str) -> pd.DataFrame:
+        """按日期批量获取全市场日线数据（返回原始价格，需手动复权）"""
+        return self._retry_request(self.pro.daily, trade_date=trade_date)
+
+    def get_adj_factor_by_date(self, trade_date: str) -> pd.DataFrame:
+        """按日期批量获取全市场复权因子"""
+        return self._retry_request(self.pro.adj_factor, trade_date=trade_date)
+
+    def get_daily_basic_by_date(self, trade_date: str) -> pd.DataFrame:
+        """按日期批量获取全市场每日指标"""
+        fields = [
+            'ts_code', 'trade_date', 'close',
+            'turnover_rate', 'turnover_rate_f', 'volume_ratio',
+            'pe', 'pe_ttm', 'pb', 'ps', 'ps_ttm',
+            'dv_ratio', 'dv_ttm',
+            'total_share', 'float_share', 'free_share',
+            'total_mv', 'circ_mv'
+        ]
+        return self._retry_request(
+            self.pro.daily_basic, trade_date=trade_date, fields=','.join(fields)
+        )
+
+    def get_moneyflow_by_date(self, trade_date: str) -> pd.DataFrame:
+        """按日期批量获取全市场资金流向"""
+        fields = [
+            'ts_code', 'trade_date',
+            'buy_sm_amount', 'sell_sm_amount',
+            'buy_md_amount', 'sell_md_amount',
+            'buy_lg_amount', 'sell_lg_amount',
+            'buy_elg_amount', 'sell_elg_amount',
+            'net_mf_amount'
+        ]
+        return self._retry_request(
+            self.pro.moneyflow, trade_date=trade_date, fields=','.join(fields)
+        )
+
     def get_index_basic(self, market: str = '') -> pd.DataFrame:
         """
         获取指数基本信息

@@ -55,19 +55,18 @@ def is_trading_day(date: datetime) -> bool:
     return date.weekday() < 5   # 0=Mon … 4=Fri
 
 
-def get_latest_db_date(table: str, date_col: str = 'trade_date') -> str:
-    """查询指定表的最新数据日期"""
-    import duckdb
-    from data_collect.config import config
+def get_latest_db_date(conn, table: str, date_col: str = 'trade_date') -> str:
+    """用已有连接查询指定表的最新数据日期（避免 read_only 冲突）"""
     try:
-        with duckdb.connect(config.db_path, read_only=True) as conn:
-            result = conn.execute(
-                f"SELECT MAX({date_col}) FROM {table}"
-            ).fetchone()[0]
+        result = conn.execute(f"SELECT MAX({date_col}) FROM {table}").fetchone()[0]
         return str(result).replace('-', '') if result else '20160101'
     except Exception as e:
         log.warning(f"查询 {table}.{date_col} 失败: {e}")
         return '20160101'
+
+
+# 增量窗口超过此天数改用逐股模式（全量重建场景）
+BATCH_INCREMENTAL_MAX_DAYS = 60
 
 
 def retry(func, max_attempts: int = 3, delay: int = 60, label: str = ''):
@@ -99,44 +98,59 @@ def step_stock_basic(collector) -> bool:
     return retry(collector.collect_stock_basic, label='stock_basic')
 
 
+def _get_incremental_start(collector, table: str, date_col: str = 'trade_date') -> tuple:
+    """
+    用 collector 的已有连接查询最新日期，返回 (latest_str, start_date_str)。
+    避免另开 read_only 连接造成的 DuckDB 锁冲突。
+    """
+    collector.db.connect()
+    latest = get_latest_db_date(collector.db.conn, table, date_col)
+    today = datetime.now().strftime('%Y%m%d')
+    if latest and latest > '20160101':
+        start = (datetime.strptime(latest, '%Y%m%d') + timedelta(days=1)).strftime('%Y%m%d')
+    else:
+        start = None  # 回退到逐股全量
+    return latest, start, today
+
+
 def step_daily_price(collector) -> bool:
-    """增量更新个股日线（前复权）"""
-    latest = get_latest_db_date('daily_price')
+    """增量更新个股日线（前复权）—— 短窗口用批量接口，长窗口用逐股接口"""
+    latest, start, end = _get_incremental_start(collector, 'daily_price')
     log.info(f"▶ [2/7] 增量更新日线价格 (daily_price)，当前最新: {latest}")
-    return retry(
-        lambda: collector.collect_daily_price(incremental=True),
-        label='daily_price',
-    )
+    if start and (datetime.strptime(end, '%Y%m%d') - datetime.strptime(start, '%Y%m%d')).days <= BATCH_INCREMENTAL_MAX_DAYS:
+        log.info(f"  → 批量模式: {start} ~ {end}")
+        return retry(lambda: collector.collect_daily_price_batch(start, end), label='daily_price_batch')
+    log.info("  → 逐股模式（窗口 > 60天或首次建库）")
+    return retry(lambda: collector.collect_daily_price(incremental=True), label='daily_price')
 
 
 def step_daily_basic(collector) -> bool:
     """增量更新每日指标（市值/PE/换手率）"""
-    latest = get_latest_db_date('daily_basic')
+    latest, start, end = _get_incremental_start(collector, 'daily_basic')
     log.info(f"▶ [3/7] 增量更新每日指标 (daily_basic)，当前最新: {latest}")
-    return retry(
-        lambda: collector.collect_daily_basic(incremental=True),
-        label='daily_basic',
-    )
+    if start and (datetime.strptime(end, '%Y%m%d') - datetime.strptime(start, '%Y%m%d')).days <= BATCH_INCREMENTAL_MAX_DAYS:
+        log.info(f"  → 批量模式: {start} ~ {end}")
+        return retry(lambda: collector.collect_daily_basic_batch(start, end), label='daily_basic_batch')
+    log.info("  → 逐股模式（窗口 > 60天或首次建库）")
+    return retry(lambda: collector.collect_daily_basic(incremental=True), label='daily_basic')
 
 
 def step_moneyflow(collector) -> bool:
     """增量更新资金流向"""
-    latest = get_latest_db_date('moneyflow')
+    latest, start, end = _get_incremental_start(collector, 'moneyflow')
     log.info(f"▶ [4/7] 增量更新资金流向 (moneyflow)，当前最新: {latest}")
-    return retry(
-        lambda: collector.collect_moneyflow(incremental=True),
-        label='moneyflow',
-    )
+    if start and (datetime.strptime(end, '%Y%m%d') - datetime.strptime(start, '%Y%m%d')).days <= BATCH_INCREMENTAL_MAX_DAYS:
+        log.info(f"  → 批量模式: {start} ~ {end}")
+        return retry(lambda: collector.collect_moneyflow_batch(start, end), label='moneyflow_batch')
+    log.info("  → 逐股模式（窗口 > 60天或首次建库）")
+    return retry(lambda: collector.collect_moneyflow(incremental=True), label='moneyflow')
 
 
 def step_index(collector) -> bool:
     """增量更新指数日线（CSI300 等 6 个主要指数）"""
-    latest = get_latest_db_date('index_daily')
+    latest, _, _ = _get_incremental_start(collector, 'index_daily')
     log.info(f"▶ [5/7] 增量更新指数日线 (index_daily)，当前最新: {latest}")
-    return retry(
-        lambda: collector.collect_index_data(incremental=True),
-        label='index_daily',
-    )
+    return retry(lambda: collector.collect_index_data(incremental=True), label='index_daily')
 
 
 def step_financial(collector) -> bool:

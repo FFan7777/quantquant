@@ -1221,7 +1221,8 @@ def main():
     test_panel_cls = panel[panel.index >= cfg.test_start].dropna(subset=['label'])
 
     if len(test_panel_cls) == 0:
-        print("  警告：测试集（有标签）为空，请检查 test_start 参数")
+        print("  警告：测试集（有标签）为空，跳过评估，直接保存预测")
+        save_predictions(panel, prob_all, cfg)
         return
 
     # 模拟面板：需要全部测试日（含 close<MA20 的空仓期）

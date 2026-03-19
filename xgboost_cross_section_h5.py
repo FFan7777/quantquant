@@ -52,9 +52,9 @@ HORIZON       = 5                    # 预测窗口（交易日）
 REBAL_FREQ    = 5                    # 调仓频率（交易日）
 DATA_START    = "20160101"           # 数据加载起点（含预热期）
 TRAIN_START   = "20180101"           # 训练集起点
-# 与 xgboost_cross_section.py LONG_VAL=True 保持完全一致
+# 与 xgboost_cross_section.py 保持一致：Train 2018-2021（4年），Val 2022-2024（多周期）
 TRAIN_END     = "20211231"           # Train: 2018-2021（4年）
-VAL_START     = "20220201"           # Val: 2022-2024（3年，含20日隔离）
+VAL_START     = "20220201"           # Val: 2022-2024（3年，含2022熊市，多周期验证）
 VAL_END       = "20241231"
 TEST_START    = "20250201"           # Test: 2025+（VAL_END后+20交易日隔离）
 END_DATE      = "20260316"           # 数据终点（当前最新）
@@ -71,13 +71,19 @@ OUTPUT_DIR    = "output"
 #      mf_20d_mv/large_net_20d_ratio (20日资金), gross_margin_chg_yoy (毛利率拐点),
 #      ocf_to_ni (盈利质量), holder_chg_qoq (筹码集中度, 最重要A股特有因子)
 TECH_COLS   = ['ret_1d', 'ret_5d', 'ret_20d', 'ret_60d', 'ret_120d',
-               'vol_20d', 'close_vs_ma20', 'close_vs_ma60', 'close_vs_ma120', 'rsi_14']
+               'vol_20d', 'close_vs_ma20', 'close_vs_ma60', 'close_vs_ma120', 'rsi_14',
+               # Alpha158 扩充特征（剔除 skew_20d importance=0.69% 噪声）
+               'amplitude_1d', 'open_vs_close',
+               'dist_from_high_5d', 'dist_from_low_5d', 'dist_from_high_20d',
+               'high_low_ratio_20d', 'vol_ratio_5_20']
 BASIC_COLS  = ['pe_ttm', 'pb', 'log_mktcap', 'turnover_20d', 'volume_ratio', 'dv_ratio']
 MF_COLS     = ['mf_1d_mv', 'mf_5d_mv', 'mf_20d_mv',
-               'large_net_5d_ratio', 'large_net_20d_ratio']
-FUND_COLS   = ['roe_ann', 'roa', 'gross_margin', 'debt_ratio',
-               'current_ratio', 'fscore', 'rev_growth_yoy', 'ni_growth_yoy',
-               'gross_margin_chg_yoy', 'ocf_to_ni']
+               'large_net_5d_ratio', 'large_net_20d_ratio',
+               'retail_net_5d_ratio', 'smart_retail_divergence_5d']
+FUND_COLS   = ['roe_ann', 'roa', 'fscore', 'rev_growth_yoy', 'ni_growth_yoy',
+               'gross_margin_chg_yoy',
+               # 剔除: gross_margin(低imp), debt_ratio(低imp), ocf_to_ni(低imp), current_ratio(低imp)
+               ]
 ANALYST_COLS = ['analyst_count', 'np_yield']
 HOLDER_COLS  = ['holder_chg_qoq']
 ALL_FEATURES = TECH_COLS + BASIC_COLS + MF_COLS + FUND_COLS + ANALYST_COLS + HOLDER_COLS
@@ -119,7 +125,7 @@ def load_tech_basic_features(conn) -> pd.DataFrame:
     print("  加载技术面 & 估值特征（SQL窗口函数）...")
     df = conn.execute(f"""
         WITH dp AS (
-            SELECT ts_code, trade_date, close, pct_chg, vol
+            SELECT ts_code, trade_date, open, high, low, close, pre_close, pct_chg, vol
             FROM daily_price
             WHERE trade_date >= '{DATA_START}' AND trade_date <= '{END_DATE}'
               AND ts_code NOT LIKE '8%'
@@ -137,7 +143,22 @@ def load_tech_basic_features(conn) -> pd.DataFrame:
                     * SQRT(252)                               AS vol_20d,
                 AVG(close) OVER (w ROWS BETWEEN 19  PRECEDING AND CURRENT ROW) AS ma20,
                 AVG(close) OVER (w ROWS BETWEEN 59  PRECEDING AND CURRENT ROW) AS ma60,
-                AVG(close) OVER (w ROWS BETWEEN 119 PRECEDING AND CURRENT ROW) AS ma120
+                AVG(close) OVER (w ROWS BETWEEN 119 PRECEDING AND CURRENT ROW) AS ma120,
+                -- Alpha158 扩充特征
+                (high - low) / NULLIF(pre_close, 0)           AS amplitude_1d,
+                open / NULLIF(pre_close, 0) - 1               AS open_vs_close,
+                close / NULLIF(MAX(high) OVER (w ROWS BETWEEN 4  PRECEDING AND CURRENT ROW), 0) - 1
+                                                              AS dist_from_high_5d,
+                close / NULLIF(MIN(low)  OVER (w ROWS BETWEEN 4  PRECEDING AND CURRENT ROW), 0) - 1
+                                                              AS dist_from_low_5d,
+                close / NULLIF(MAX(high) OVER (w ROWS BETWEEN 19 PRECEDING AND CURRENT ROW), 0) - 1
+                                                              AS dist_from_high_20d,
+                MAX(high) OVER (w ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) /
+                  NULLIF(MIN(low) OVER (w ROWS BETWEEN 19 PRECEDING AND CURRENT ROW), 0) - 1
+                                                              AS high_low_ratio_20d,
+                AVG(vol) OVER (w ROWS BETWEEN 4  PRECEDING AND CURRENT ROW) /
+                  NULLIF(AVG(vol) OVER (w ROWS BETWEEN 19 PRECEDING AND CURRENT ROW), 0)
+                                                              AS vol_ratio_5_20
             FROM dp
             WINDOW w AS (PARTITION BY ts_code ORDER BY trade_date)
         ),
@@ -164,13 +185,24 @@ def load_tech_basic_features(conn) -> pd.DataFrame:
             t.close / NULLIF(t.ma60,   0) - 1            AS close_vs_ma60,
             t.close / NULLIF(t.ma120,  0) - 1            AS close_vs_ma120,
             d.pe_ttm, d.pb, d.log_mktcap, d.total_mv_100m,
-            d.turnover_20d, d.volume_ratio, d.dv_ratio
+            d.turnover_20d, d.volume_ratio, d.dv_ratio,
+            t.amplitude_1d, t.open_vs_close,
+            t.dist_from_high_5d, t.dist_from_low_5d, t.dist_from_high_20d,
+            t.high_low_ratio_20d, t.vol_ratio_5_20
         FROM tech t
         JOIN db d ON t.ts_code = d.ts_code AND t.trade_date = d.trade_date
         WHERE t.ret_60d IS NOT NULL        -- 确保至少有60天历史
           AND d.log_mktcap IS NOT NULL
     """).fetchdf()
     df['trade_date'] = df['trade_date'].astype(str)
+
+    # skew_20d：20日收益率偏度
+    df = df.sort_values(['ts_code', 'trade_date'])
+    df['skew_20d'] = (
+        df.groupby('ts_code')['ret_1d']
+        .transform(lambda s: s.rolling(20, min_periods=10).skew())
+    )
+
     print(f"    技术/估值特征: {len(df):,} 行, {df['ts_code'].nunique()} 只股票")
     return df
 
@@ -236,7 +268,13 @@ def load_moneyflow_features(conn) -> pd.DataFrame:
                 + sell_sm_amount + sell_md_amount + sell_lg_amount + sell_elg_amount) OVER (
                 PARTITION BY ts_code ORDER BY trade_date
                 ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
-            )  AS total_flow_20d
+            )  AS total_flow_20d,
+            -- 散户净流向（小单+中单）5日累计
+            SUM(buy_sm_amount + buy_md_amount
+                - sell_sm_amount - sell_md_amount) OVER (
+                PARTITION BY ts_code ORDER BY trade_date
+                ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
+            )  AS retail_net_5d
         FROM moneyflow
         WHERE trade_date >= '{DATA_START}' AND trade_date <= '{END_DATE}'
     """).fetchdf()
@@ -714,8 +752,18 @@ def build_panel(tech_df: pd.DataFrame,
     base["mf_20d_mv"]          = base["mf_20d_raw"]   / mv_wan.replace(0, np.nan)
     base["large_net_5d_ratio"] = base["large_net_5d"]  / base["total_flow_5d"].replace(0, np.nan)
     base["large_net_20d_ratio"]= base["large_net_20d"] / base["total_flow_20d"].replace(0, np.nan)
+    if "retail_net_5d" in base.columns:
+        base["retail_net_5d_ratio"] = base["retail_net_5d"] / mv_wan.replace(0, np.nan)
+        large_net  = base["large_net_5d"]
+        retail_net = base["retail_net_5d"]
+        base["smart_retail_divergence_5d"] = (
+            (large_net - retail_net) / base["total_flow_5d"].replace(0, np.nan)
+        )
+    else:
+        base["retail_net_5d_ratio"]         = np.nan
+        base["smart_retail_divergence_5d"]  = np.nan
     base = base.drop(columns=["mf_1d_raw", "mf_5d_raw", "mf_20d_raw",
-                               "large_net_5d", "large_net_20d",
+                               "large_net_5d", "large_net_20d", "retail_net_5d",
                                "total_flow_5d", "total_flow_20d"],
                      errors="ignore")
 
@@ -830,8 +878,9 @@ def preprocess_panel(panel: pd.DataFrame,
             mu, std = s.mean(), s.std()
             if std > 0:
                 grp[col] = (s - mu) / std
-            else:
+            elif not s.isna().all():
                 grp[col] = 0.0
+            # else: 全NaN，保持原值不动
         return grp
 
     processed = []

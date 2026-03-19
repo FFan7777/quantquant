@@ -67,12 +67,12 @@ from data_collect.config import config
 # ══════════════════════════════════════════════════════════════════════
 
 DB_PATH        = config.db_path
-BACKTEST_START = '20250210'   # H10+H5 test predictions start from 20250210
+BACKTEST_START = '20220101'   # val predictions start 20220210; test 20250210
 BACKTEST_END   = '20260316'
 
 # 持仓槽位（权重 = 总净值 / MAX_SLOTS，固定不变）
 MAX_SLOTS     = 8      # 满仓最大持股（Val Minimax 最优）
-HALF_SLOTS    = 2      # 半仓最大持股（Val Minimax 最优，之前3）
+HALF_SLOTS    = 3      # 半仓最大持股（v5 最优，HP search minimax 偏好2但v5 OOS更佳）
 BEAR_SLOTS    = 0    # 熊市（slots=0）时不主动调仓（=0禁用），持仓由风控自然退出
 
 # 个股风控参数
@@ -123,11 +123,13 @@ MIN_TRADE_VALUE = 2000.0   # 小于此值的漂移不执行
 INITIAL_CAPITAL = 1_000_000.0   # 初始资金 100 万
 
 # 预测文件路径
-INDEX_TIMING_FILE = ROOT / 'output' / 'csv' / 'index_timing_predictions.csv'
-CS_PRED_FILE      = ROOT / 'output' / 'csv' / 'xgb_cross_section_predictions.csv'
-CS_PRED_H5_FILE   = ROOT / 'output' / 'csv' / 'xgb_cs_pred_h5.csv'   # HORIZON=5 ensemble
-CS_PRED_H20_FILE  = ROOT / 'output' / 'csv' / 'xgb_cs_pred_h20.csv'  # HORIZON=20 ensemble
-OUT_DIR           = ROOT / 'output' / 'index_ma_combined'
+INDEX_TIMING_FILE    = ROOT / 'output' / 'csv' / 'index_timing_predictions.csv'
+CS_PRED_FILE         = ROOT / 'output' / 'csv' / 'xgb_cross_section_predictions.csv'
+CS_PRED_H5_FILE      = ROOT / 'output' / 'csv' / 'xgb_cs_pred_h5.csv'
+CS_PRED_H20_FILE     = ROOT / 'output' / 'csv' / 'xgb_cs_pred_h20.csv'
+CS_PRED_VAL_FILE     = ROOT / 'output' / 'csv' / 'xgb_cs_pred_val.csv'     # H10 val (2022-2024)
+CS_PRED_VAL_H5_FILE  = ROOT / 'output' / 'csv' / 'xgb_cs_pred_val_h5.csv'  # H5  val (2022-2024)
+OUT_DIR              = ROOT / 'output' / 'index_ma_combined'
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -176,32 +178,42 @@ def load_index_timing_slots() -> pd.Series:
     return slots
 
 
+def _load_pred_pair(test_file, val_file, label: str) -> pd.DataFrame:
+    """加载 test+val 预测并拼接（val 只取 < test 最早日期的部分）"""
+    df_test = pd.read_csv(test_file, dtype={'trade_date': str})
+    df_test['trade_date'] = df_test['trade_date'].apply(_norm_date)
+    df_test = df_test[(df_test['trade_date'] >= BACKTEST_START) &
+                      (df_test['trade_date'] <= BACKTEST_END)]
+    if val_file.exists():
+        df_val = pd.read_csv(val_file, dtype={'trade_date': str})
+        df_val['trade_date'] = df_val['trade_date'].apply(_norm_date)
+        test_min = df_test['trade_date'].min() if len(df_test) else '99999999'
+        df_val = df_val[(df_val['trade_date'] >= BACKTEST_START) &
+                        (df_val['trade_date'] < test_min)]
+        df = pd.concat([df_val, df_test], ignore_index=True)
+    else:
+        df = df_test
+    return df
+
+
 def load_cs_predictions() -> pd.DataFrame:
-    """加载截面选股预测（2023-2025，严格样本外）。若 H5 文件存在则与 H10 融合"""
+    """加载截面选股预测（val 2022-2024 + test 2025+）。若 H5 文件存在则与 H10 融合"""
     if not CS_PRED_FILE.exists():
         raise FileNotFoundError(
             f"找不到截面选股预测: {CS_PRED_FILE}\n"
             "请先运行 xgboost_cross_section.py 生成预测"
         )
-    df = pd.read_csv(CS_PRED_FILE, dtype={'trade_date': str})
-    df['trade_date'] = df['trade_date'].apply(_norm_date)
-    df = df[(df['trade_date'] >= BACKTEST_START) &
-            (df['trade_date'] <= BACKTEST_END)]
+    df = _load_pred_pair(CS_PRED_FILE, CS_PRED_VAL_FILE, 'H10')
 
     # 若 H5 预测文件存在，融合两个模型（rank 平均）
     if CS_PRED_H5_FILE.exists():
-        df5 = pd.read_csv(CS_PRED_H5_FILE, dtype={'trade_date': str})
-        df5['trade_date'] = df5['trade_date'].apply(_norm_date)
-        df5 = df5[(df5['trade_date'] >= BACKTEST_START) &
-                  (df5['trade_date'] <= BACKTEST_END)]
+        df5 = _load_pred_pair(CS_PRED_H5_FILE, CS_PRED_VAL_H5_FILE, 'H5')
         df5 = df5.rename(columns={'pred': 'pred_h5'})
         df = df.merge(df5[['ts_code', 'trade_date', 'pred_h5']],
                       on=['ts_code', 'trade_date'], how='inner')
-        # 截面 rank 后平均（避免不同 horizon 量纲差异）
         df['r10'] = df.groupby('trade_date')['pred'].rank(pct=True)
         df['r5']  = df.groupby('trade_date')['pred_h5'].rank(pct=True)
-
-        df['pred'] = 0.7 * df['r10'] + 0.3 * df['r5']
+        df['pred'] = 0.70 * df['r10'] + 0.30 * df['r5']
         print(f"  截面选股 [H10+H5 ensemble 70/30]: {len(df):,} 行  "
               f"{df['trade_date'].nunique()} 个调仓日  "
               f"{df['ts_code'].nunique()} 只股票")
@@ -230,16 +242,17 @@ def get_slots_on_date(slots_series: pd.Series, date: str) -> int:
 # 4. 价格数据 & 安全过滤
 # ══════════════════════════════════════════════════════════════════════
 
-def load_price_data() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def load_price_data() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     加载日线价格（含预热期 2022-11 用于 MA 计算）。
-    返回: (price_pivot, ma5_pivot, ma20_pivot, vol_pivot, retvol20_pivot)  shape=date×ts_code
-    retvol20: 20日日收益率标准差，用于风险平价加权
+    返回: (price_pivot, ma5_pivot, ma20_pivot, vol_pivot, retvol20_pivot, open_pivot, pct_chg_pivot)
+    open_pivot:   T 日开盘价矩阵，用于 T+1 执行
+    pct_chg_pivot: 涨跌幅矩阵，用于涨跌停过滤
     """
     print("  加载个股日线价格...")
     with get_conn() as conn:
         df = conn.execute(f"""
-            SELECT trade_date, ts_code, close, vol
+            SELECT trade_date, ts_code, close, open, pct_chg, vol
             FROM daily_price
             WHERE trade_date >= '20221101'
               AND trade_date <= '{BACKTEST_END}'
@@ -249,23 +262,27 @@ def load_price_data() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Data
         """).fetchdf()
 
     df['trade_date'] = df['trade_date'].apply(_norm_date)
-    price_pv = df.pivot(index='trade_date', columns='ts_code', values='close')
-    vol_pv   = df.pivot(index='trade_date', columns='ts_code', values='vol')
+    price_pv   = df.pivot(index='trade_date', columns='ts_code', values='close')
+    open_pv    = df.pivot(index='trade_date', columns='ts_code', values='open')
+    pct_chg_pv = df.pivot(index='trade_date', columns='ts_code', values='pct_chg')
+    vol_pv     = df.pivot(index='trade_date', columns='ts_code', values='vol')
 
-    ma5_pv     = price_pv.rolling(5,  min_periods=3).mean()
-    ma20_pv    = price_pv.rolling(20, min_periods=10).mean()
+    ma5_pv      = price_pv.rolling(5,  min_periods=3).mean()
+    ma20_pv     = price_pv.rolling(20, min_periods=10).mean()
     retvol20_pv = price_pv.pct_change().rolling(20, min_periods=10).std()
 
     # 裁剪到回测期
     mask = price_pv.index >= BACKTEST_START
     price_pv    = price_pv[mask]
+    open_pv     = open_pv[mask]
+    pct_chg_pv  = pct_chg_pv[mask]
     vol_pv      = vol_pv[mask]
     ma5_pv      = ma5_pv[mask]
     ma20_pv     = ma20_pv[mask]
     retvol20_pv = retvol20_pv[mask]
 
     print(f"  价格矩阵: {len(price_pv)} 天 × {len(price_pv.columns):,} 只股票")
-    return price_pv, ma5_pv, ma20_pv, vol_pv, retvol20_pv
+    return price_pv, ma5_pv, ma20_pv, vol_pv, retvol20_pv, open_pv, pct_chg_pv
 
 
 def load_safety_filters(rebal_dates: List[str]) -> Dict[str, set]:
@@ -504,6 +521,7 @@ def rebalance(
     date: str,
     slot_confirmed: bool = True,
     ret_vol: pd.Series = None,
+    exec_prices: pd.Series = None,   # T+1 开盘价，用于实际成交；None 则退化到 T 收盘
 ) -> int:
     """
     按 CS 模型打分排列的 target_stocks 调仓。
@@ -513,9 +531,13 @@ def rebalance(
 
     slot_confirmed = False → 只执行卖出，暂不买入（slots刚转正未稳定）
     ret_vol        = 20日收益率波动率 Series，USE_VOL_SCALE=True 时用于反比加权
+    exec_prices    = T+1 开盘价 Series（T+1 执行模型）
     """
     if n_slots == 0:
         return 0
+
+    # 估值用 T 收盘价；执行用 T+1 开盘价（若不可用则退化到 T 收盘）
+    ep = exec_prices if exec_prices is not None else prices
 
     total_val   = portfolio.total_value(prices)
     target_set  = set(target_stocks[:n_slots])
@@ -523,16 +545,16 @@ def rebalance(
 
     trades = 0
 
-    # 卖出：不在目标中且持满 MIN_HOLD_DAYS 的仓位（按 ts_code 排序确保确定性）
+    # 卖出：不在目标中且持满 MIN_HOLD_DAYS 的仓位
     for ts in sorted(current_set - target_set):
         hd = portfolio.hold_days.get(ts, 0)
         if hd >= MIN_HOLD_DAYS:
-            p = prices.get(ts, np.nan)
+            p = ep.get(ts, np.nan)
             if pd.notna(p) and p > 0:
                 portfolio.sell(ts, p, date)
                 trades += 1
 
-    # 买入：按 pred 得分顺序买入尚未持有的目标股（保证确定性）
+    # 买入：按 pred 得分顺序买入尚未持有的目标股
     if slot_confirmed:
         target_list = target_stocks[:n_slots]
         top_stocks  = [ts for ts in target_list if ts not in portfolio.shares]
@@ -552,8 +574,6 @@ def rebalance(
             sig_scale_map = {ts: 1.0 for ts in target_list}
 
         if USE_VOL_SCALE and ret_vol is not None and len(top_stocks) > 0:
-            # 风险平价：每只股票独立按波动率反比缩放基础槽位
-            # scale = median_vol / this_vol，限制在 [0.5, 2.0] 倍基础槽位
             vols = np.array([float(ret_vol.get(ts, np.nan) or np.nan)
                              if pd.notna(ret_vol.get(ts, np.nan)) else np.nan
                              for ts in top_stocks])
@@ -568,7 +588,7 @@ def rebalance(
                            for ts in top_stocks}
 
         for ts in top_stocks:
-            p = prices.get(ts, np.nan)
+            p = ep.get(ts, np.nan)    # T+1 开盘价执行
             if pd.isna(p) or p <= 0:
                 continue
             if portfolio.buy(ts, p, slot_values[ts], date):
@@ -592,6 +612,8 @@ def run_backtest(
     rebal_set:    set,
     csi300_mom:   pd.Series = None,  # CSI300 5日收益，用于入场过滤
     retvol20_pv:  pd.DataFrame = None,  # 20日收益率波动率，用于风险平价
+    open_pv:      pd.DataFrame = None,  # T+1 开盘价矩阵（T+1 执行）
+    pct_chg_pv:   pd.DataFrame = None,  # 涨跌幅矩阵（涨跌停过滤）
 ) -> Tuple[pd.DataFrame, List[dict]]:
     """
     日频回测主循环。
@@ -609,10 +631,12 @@ def run_backtest(
           f"bear(md={BEAR_MA_DEATH},mh={BEAR_MIN_HOLD})  "
           f"stop={STOP_LOSS_ENTRY:.0%}  slot_confirm={SLOT_CONFIRM_DAYS}d  "
           f"vol_scale={USE_VOL_SCALE}")
+    print(f"  执行模型: {'T+1开盘' if open_pv is not None else 'T收盘（无开盘数据）'}")
     pf = Portfolio(INITIAL_CAPITAL)
 
-    # 预计算涨跌幅（用于涨跌停过滤）
-    pct_chg_pv = price_pv.pct_change()
+    # 涨跌幅矩阵（若未传入则从 close 推算，精度低）
+    if pct_chg_pv is None:
+        pct_chg_pv = price_pv.pct_change()
 
     cs_by_date: Dict[str, pd.DataFrame] = {
         dt: grp for dt, grp in cs_preds.groupby('trade_date')
@@ -646,12 +670,32 @@ def run_backtest(
         ma5    = ma5_pv.loc[date]  if date in ma5_pv.index  else pd.Series(dtype=float)
         ma20   = ma20_pv.loc[date] if date in ma20_pv.index else pd.Series(dtype=float)
 
+        # T+1 执行价：取下一交易日开盘价；最后一天退化到当日收盘
+        next_date = all_dates[i + 1] if i + 1 < len(all_dates) else date
+        if open_pv is not None and next_date in open_pv.index:
+            exec_prices = open_pv.loc[next_date]
+        else:
+            exec_prices = prices  # 退化到 T 收盘
+
+        # T+1 涨跌幅（用于涨跌停过滤）
+        if pct_chg_pv is not None and next_date in pct_chg_pv.index:
+            exec_pct = pct_chg_pv.loc[next_date]
+        else:
+            exec_pct = None
+
         # ── ① 每日风控：止损 / 追踪止损 / MA 死叉 ────────────────────────
-        # 熊市模式：止损收紧至 6%，MA 死叉检查仅需 BEAR_MIN_HOLD 天
+        # 风控基于 T 收盘价触发，执行价用 T+1 开盘（exec_prices）
         exits = daily_stop_check(pf, prices, ma5, ma20, date, slots_today=slots_today)
         for ts in exits:
-            p_raw = prices.get(ts, np.nan)
-            p = float(p_raw if pd.notna(p_raw) and p_raw > 0 else pf.entry_price.get(ts, 1.0))
+            ep_raw = exec_prices.get(ts, np.nan)
+            # 跌停检查：T+1 跌停时无法卖出（持仓被锁）
+            if exec_pct is not None:
+                pct_val = exec_pct.get(ts, np.nan)
+                is_star = ts[:3] in ('688', '300', '301')
+                limit_dn = -19.9 if is_star else -9.9
+                if pd.notna(pct_val) and pct_val <= limit_dn:
+                    continue   # 跌停，本日无法卖出，保留持仓
+            p = float(ep_raw if pd.notna(ep_raw) and ep_raw > 0 else pf.entry_price.get(ts, 1.0))
             cash_rcv = pf.sell(ts, p, date)
             trade_log.append({
                 'date': date, 'ts_code': ts,
@@ -671,8 +715,15 @@ def run_backtest(
             # ── 延迟熊市清仓：连续 BEAR_EXIT_REBAL_DAYS 个调仓日均为 0 才强制清仓 ──
             if BEAR_FAST_EXIT and bear_mode and consec_bear_rebal >= BEAR_EXIT_REBAL_DAYS:
                 for ts in list(pf.shares):
-                    p = float(prices.get(ts, np.nan))
-                    if np.isfinite(p) and p > 0:
+                    ep_raw = exec_prices.get(ts, np.nan)
+                    # 跌停时无法卖出
+                    if exec_pct is not None:
+                        pct_val = exec_pct.get(ts, np.nan)
+                        is_star = ts[:3] in ('688', '300', '301')
+                        if pd.notna(pct_val) and pct_val <= (-19.9 if is_star else -9.9):
+                            continue
+                    p = float(ep_raw if np.isfinite(ep_raw) and ep_raw > 0 else 0)
+                    if p > 0:
                         cash_rcv = pf.sell(ts, p, date)
                         trade_log.append({
                             'date': date, 'ts_code': ts,
@@ -698,10 +749,15 @@ def run_backtest(
                         return pd.notna(p) and pd.notna(m20) and m20 > 0 and p > m20
                     scores_df = scores_df[scores_df['ts_code'].apply(_above_ma20)]
 
-                # ── 涨停过滤：涨停股无法买入（市场实际无卖方）────────────
-                if date in pct_chg_pv.index:
-                    pct_today = pct_chg_pv.loc[date]
-                    limit_up_stocks = set(pct_today[pct_today >= 0.095].dropna().index)
+                # ── 涨停过滤：T+1 涨停无法买入（以 T+1 pct_chg 判断）────
+                if exec_pct is not None:
+                    def _limit_up_thresh(ts_code):
+                        return 19.9 if ts_code[:3] in ('688', '300', '301') else 9.9
+                    limit_up_stocks = set(
+                        ts for ts in scores_df['ts_code']
+                        if pd.notna(exec_pct.get(ts, np.nan))
+                        and exec_pct.get(ts, 0) >= _limit_up_thresh(ts)
+                    )
                     scores_df = scores_df[~scores_df['ts_code'].isin(limit_up_stocks)]
 
                 target_stocks = scores_df['ts_code'].tolist()
@@ -718,6 +774,7 @@ def run_backtest(
                         pf, target_stocks, actual_slots, prices, date,
                         slot_confirmed=slot_confirmed,
                         ret_vol=rv_today,
+                        exec_prices=exec_prices,
                     )
                     trade_log.append({
                         'date': date, 'ts_code': 'REBAL',
@@ -968,7 +1025,7 @@ def main():
 
     # 3. 日线价格数据
     print("\n[3/6] 加载个股价格数据...")
-    price_pv, ma5_pv, ma20_pv, vol_pv, retvol20_pv = load_price_data()
+    price_pv, ma5_pv, ma20_pv, vol_pv, retvol20_pv, open_pv, pct_chg_pv = load_price_data()
 
     # 4. 确定调仓日（来自 CS 模型，每 5 日）
     all_rebal  = sorted(cs_preds['trade_date'].unique())
@@ -1001,6 +1058,8 @@ def main():
         cs_preds, index_slots, eligible, rebal_set,
         csi300_mom=csi300_mom,
         retvol20_pv=retvol20_pv,
+        open_pv=open_pv,
+        pct_chg_pv=pct_chg_pv,
     )
 
     # 7. 绩效统计 & 输出

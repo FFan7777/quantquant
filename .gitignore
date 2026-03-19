@@ -227,3 +227,5 @@ selected_stocks_forecast_with_pe.csv
 tick_select_simplified.ipynb
 CLAUDE.md
 data_collect/config.yaml
+
+.claude

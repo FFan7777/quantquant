@@ -986,6 +986,74 @@ class DataCollector:
         if failed_stocks:
             print(f"失败股票数: {len(failed_stocks)}")
 
+    # ── 批量按日期增量方法（1次API = 全市场，比逐股快100x）──────────────────────
+
+    def _get_weekday_dates(self, start_date: str, end_date: str) -> list:
+        """生成 [start_date, end_date] 内所有工作日列表（粗过滤，API返回空则跳过）"""
+        from datetime import datetime, timedelta
+        dates, cur = [], datetime.strptime(start_date, '%Y%m%d')
+        end = datetime.strptime(end_date, '%Y%m%d')
+        while cur <= end:
+            if cur.weekday() < 5:
+                dates.append(cur.strftime('%Y%m%d'))
+            cur += timedelta(days=1)
+        return dates
+
+    def collect_daily_price_batch(self, start_date: str, end_date: str) -> int:
+        """
+        按日期批量增量收集日线数据（前复权）。
+        适用于 ≤60 天的增量窗口；每个交易日 2 次 API 调用，速度比逐股快约 100x。
+        """
+        print(f"\n[批量日线] {start_date} ~ {end_date}")
+        dates = self._get_weekday_dates(start_date, end_date)
+        total = 0
+        for d in tqdm(dates, desc="批量日线(按日期)"):
+            raw = self.api.get_daily_by_date(d)
+            if raw is None or raw.empty:
+                continue
+            adj = self.api.get_adj_factor_by_date(d)
+            if adj is not None and not adj.empty:
+                raw = pd.merge(raw, adj[['ts_code', 'trade_date', 'adj_factor']],
+                               on=['ts_code', 'trade_date'], how='left')
+            else:
+                raw['adj_factor'] = 1.0
+            raw['adj_factor'] = raw['adj_factor'].fillna(1.0)
+            for col in ['open', 'high', 'low', 'close', 'pre_close']:
+                if col in raw.columns:
+                    raw[col] = raw[col] * raw['adj_factor']
+            self.db.insert_dataframe('daily_price', raw)
+            total += len(raw)
+        print(f"  批量日线完成，共 {total} 条")
+        return total
+
+    def collect_daily_basic_batch(self, start_date: str, end_date: str) -> int:
+        """按日期批量增量收集每日指标（市值/PE/换手率）"""
+        print(f"\n[批量每日指标] {start_date} ~ {end_date}")
+        dates = self._get_weekday_dates(start_date, end_date)
+        total = 0
+        for d in tqdm(dates, desc="批量每日指标(按日期)"):
+            df = self.api.get_daily_basic_by_date(d)
+            if df is None or df.empty:
+                continue
+            self.db.insert_dataframe('daily_basic', df)
+            total += len(df)
+        print(f"  批量每日指标完成，共 {total} 条")
+        return total
+
+    def collect_moneyflow_batch(self, start_date: str, end_date: str) -> int:
+        """按日期批量增量收集资金流向"""
+        print(f"\n[批量资金流向] {start_date} ~ {end_date}")
+        dates = self._get_weekday_dates(start_date, end_date)
+        total = 0
+        for d in tqdm(dates, desc="批量资金流向(按日期)"):
+            df = self.api.get_moneyflow_by_date(d)
+            if df is None or df.empty:
+                continue
+            self.db.insert_dataframe('moneyflow', df)
+            total += len(df)
+        print(f"  批量资金流向完成，共 {total} 条")
+        return total
+
     def collect_moneyflow_fast(self, start_date: Optional[str] = None,
                                end_date: Optional[str] = None,
                                resume: bool = True, workers: int = 5):
