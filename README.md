@@ -1,6 +1,6 @@
 # A股量化交易系统
 
-基于 DuckDB + XGBoost/LightGBM 的量化交易系统。当前主策略：**指数择时 × 截面选股 v6 Ensemble + HP Search v2**。
+基于 DuckDB + XGBoost/LightGBM 的量化交易系统。当前主策略：**指数择时 × 截面选股 v8（SUE + depth=[3,4]）**。
 
 ---
 
@@ -30,7 +30,7 @@ python infer_today.py --holdings h.json # 带持仓退出检查
 
 ---
 
-## 当前策略：v6 Ensemble + HP Search v2
+## 当前策略：v8 Ensemble（含 SUE + depth=[3,4]）
 
 ### 架构
 
@@ -79,46 +79,51 @@ T+1 执行
 | 10 | 半仓 | MA20 ≤ CSI300 < MA60 |
 | 20 | 满仓 | CSI300 ≥ MA60 且 ML 看涨 |
 
-### 截面选股特征（39 个）
+### 截面选股特征（44 个）
 
 | 类别 | 特征 |
 |------|------|
 | 技术面基础（10） | ret_1d/5d/20d/60d/120d, vol_20d, close_vs_ma20/60/120, rsi_14 |
-| Alpha158 新增（7） | amplitude_1d, open_vs_close, dist_from_high_5d/20d, dist_from_low_5d, high_low_ratio_20d, vol_ratio_5_20 |
+| Alpha158（7） | amplitude_1d, open_vs_close, dist_from_high_5d/20d, dist_from_low_5d, high_low_ratio_20d, vol_ratio_5_20 |
 | 估值/流动性（6） | pe_ttm, pb, log_mktcap, turnover_20d, volume_ratio, dv_ratio |
 | 资金流向（7） | mf_1d/5d/20d_mv, large_net_5d/20d_ratio, retail_net_5d_ratio, smart_retail_divergence_5d |
-| 基本面 PIT（6） | roe_ann, roa, fscore, rev/ni_growth_yoy, gross_margin_chg_yoy |
-| 分析师预期（2） | analyst_count, np_yield（覆盖率 ~48%，缺失补 0） |
+| 基本面 PIT（7） | roe_ann, roa, fscore, rev/ni_growth_yoy, gross_margin_chg_yoy, **sue** |
+| 分析师预期（3） | analyst_count, np_yield, **analyst_rev_30d**（修正动量：近30d预测/31-90d预测-1）|
 | 股东户数（1） | holder_chg_qoq |
+| **非线性交叉（3）** | **smart_momentum**（ret_20d×large_net_20d_ratio），**momentum_adj_reversal**（ret_60d-ret_5d），**quality_value_score**（ni_growth_yoy/pe_ttm）|
 
-> 已剪枝（重要性 < 0.7%，去除后 OOS 无损）：skew_20d、gross_margin、debt_ratio、ocf_to_ni、current_ratio
+> 已剪枝（重要性 < 0.7%）：skew_20d、gross_margin、debt_ratio、ocf_to_ni、current_ratio
+> `analyst_rev_30d`、`sue` 排除在行业/市值中性化之外（绝对方向信号）
 
-**CS 模型指标（测试集 2025+，Train 2018–2021 / Val 2022–2024）**：
+**CS 模型指标（测试集 2025+，Train 2018–2021 / Val 2022–2024，44特征，v8）**：
 
 | 模型 | Val ICIR | Test ICIR | Test GAUC |
 |------|----------|-----------|-----------|
-| H10（10日 horizon） | +1.143（train+val） | +1.077 | 0.5601 |
-| H5（5日 horizon） | +1.092 | +1.110 | 0.5454 |
+| H10（10日 horizon） | +1.212（train+val） | **+1.087** | 0.5591 |
+| H5（5日 horizon） | +1.044（val） | **+1.104** | 0.5453 |
+| v7 H10（无 SUE，参考） | +1.242 | +1.070 | 0.5580 |
+| v7 H5（无 SUE，参考） | +1.061 | +1.077 | 0.5443 |
 
 ### 回测结果
 
-**完整区间（2022-2026，val+test 拼接，T+1 执行）**：
+**完整区间（2023-2026，T+1 执行，v8 代表性运行）**：
 
 | 指标 | 值 |
 |------|-----|
-| 总收益率 | **+85.90%** |
-| 年化收益率 | **+20.40%** |
-| 最大回撤 | **-13.51%** |
-| 夏普比率 | **1.004** |
-| 卡玛比率 | **1.509** |
+| 总收益率 | **+100.83%** |
+| 年化收益率 | **+23.21%** |
+| 最大回撤 | **-14.34%** |
+| 夏普比率 | **1.054** |
+| 卡玛比率 | **1.619** |
 
 | 年份 | 收益率 | 说明 |
 |------|--------|------|
-| 2022 | 含于总收益 | CS 模型 Val 期 |
-| 2023 | +15.17% | CS 模型 Val 期 |
-| 2024 | +30.28% | CS 模型 Val 期 |
-| 2025 | +25.85% | **严格 OOS（CS+HP 均未见）** |
-| 2026（至3月） | +6.92% | **严格 OOS** |
+| 2023 | **+12.04%** | CS 模型 Val 期（A股弱市，指数-11%）|
+| 2024 | +34.38% | CS 模型 Val 期 |
+| 2025 | +35.52% | **严格 OOS（CS+HP 均未见）** |
+| 2026（至3月）| +7.06% | **严格 OOS** |
+
+> **年化收益预期范围 ~21–24%**：LightGBM 无固定 seed，每次重训 H10 年化波动 ±3%（固有特性）。v7 LGB 运气好时峰值 24.05%，Sharpe 1.092。
 
 > **T+1 执行说明**：信号由 T 日收盘生成，T+1 日开盘价成交，并过滤涨跌停不可成交股，为可实盘复现的真实模拟。与 T+0 收盘成交相比年化收益约降低 5–8%。
 
@@ -294,6 +299,12 @@ data_collection:
 | 行业动量特征 | 年化↓ | 中性化后信息丢失 |
 | WFO（Walk-Forward） | ICIR +0.005 | 耗时 10x，收益不值得 |
 | MA20/MA60 交叉纯规则择时 | 年化↓5% | 2023 牛市大量误判空仓 |
+| **LightGBM 固定 seed=42（B1 修复）** | **年化↓至~16%，已回滚** | seed=42 使 LGB val_IC 从 0.1510→0.1616，导致动态 ensemble 权重偏向 LGB（50.5%），LGB 选出不同 2025 个股导致大幅欠收益。XGB 已有 random_state=42，LGB 的随机性是系统固有设计 |
+| **turnover_accel_5_20（换手率加速度）** | **年化↓，已回滚** | 使 H10 最优深度从 4 变为 5，2024 年从+30%→+25%，整体 OOS 下滑 |
+| **large_net_vol_5d_ratio（大单净量比）** | **无法实现** | moneyflow 表仅有金额字段（buy_lg_amount 等），无股数/手字段（vol），schema 不支持 |
+| **Round 4：trend_vert_5d / overnight_intraday_div / vol_asym_20d / vw_momentum_5d** | **年化↓，已回滚** | 四个短期价格微结构因子均与现有特征高度相关，导致 H10 最优 depth 从 4 变为 5，OOS 退步（23%→22.8%）。规律：任何新特征若使 HP 搜索选到 depth=5，必须回滚 |
+| **Round 5a：analyst_dispersion（分析师预期分歧度）** | **年化↓，已回滚** | 与 `analyst_rev_30d` 高度相关，同样导致 depth 4→5，OOS 退步 |
+| **SUE + depth=5（HP 搜索自动选到）** | **OOS 退步，已修复** | HP 搜索选 depth=5 后 ICIR 1.070→1.066，OOS 下降。根因：depth=5 过拟合 2022 熊市 val 期。修复：将 `XGB_HP_GRID` 从 `d in [3,4,5]` 改为 `d in [3,4]`，再训练后 ICIR 提升至 1.087 |
 
 ### HP Search 方法论失败
 
@@ -305,4 +316,16 @@ data_collection:
 
 ---
 
-**版本**: v6+HP_v2 | **最后更新**: 2026-03-19 | **Python**: 3.14 | **数据库**: DuckDB ~6.7 GB
+---
+
+## 超参搜索关键规律
+
+| 规律 | 说明 |
+|------|------|
+| **depth=5 必须排除** | HP 搜索总倾向于在新特征上选 depth=5，但 depth=5 过拟合 val 期（2022 熊市），OOS 必退步。已将 `XGB_HP_GRID` 固定为 `d in [3, 4]` |
+| **新特征筛选标准** | 若添加新特征后 HP 搜索选到 depth=5，该特征应视为"冗余"或"与现有特征高度相关"，需回滚 |
+| **策略 HP 与 CS HP 分离** | `strategy_hp_search.py` 的 MAX_SLOTS/HALF_SLOTS 与 CS 模型的 depth/mcw/λ 独立搜索，互不干扰 |
+
+---
+
+**版本**: v8（SUE + depth=[3,4]）| **最后更新**: 2026-03-22 | **Python**: 3.14 | **数据库**: DuckDB ~6.7 GB

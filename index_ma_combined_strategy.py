@@ -71,8 +71,8 @@ BACKTEST_START = '20220101'   # val predictions start 20220210; test 20250210
 BACKTEST_END   = '20260316'
 
 # 持仓槽位（权重 = 总净值 / MAX_SLOTS，固定不变）
-MAX_SLOTS     = 8      # 满仓最大持股（Val Minimax 最优）
-HALF_SLOTS    = 3      # 半仓最大持股（v5 最优，HP search minimax 偏好2但v5 OOS更佳）
+MAX_SLOTS     = 8      # 满仓最大持股（OOS 实测最优，HP搜索常过拟合 val）
+HALF_SLOTS    = 3      # 半仓最大持股（OOS 实测最优）
 BEAR_SLOTS    = 0    # 熊市（slots=0）时不主动调仓（=0禁用），持仓由风控自然退出
 
 # 个股风控参数

@@ -81,12 +81,14 @@ MF_COLS     = ['mf_1d_mv', 'mf_5d_mv', 'mf_20d_mv',
                'large_net_5d_ratio', 'large_net_20d_ratio',
                'retail_net_5d_ratio', 'smart_retail_divergence_5d']
 FUND_COLS   = ['roe_ann', 'roa', 'fscore', 'rev_growth_yoy', 'ni_growth_yoy',
-               'gross_margin_chg_yoy',
+               'gross_margin_chg_yoy', 'sue',
                # 剔除: gross_margin(低imp), debt_ratio(低imp), ocf_to_ni(低imp), current_ratio(低imp)
                ]
-ANALYST_COLS = ['analyst_count', 'np_yield']
+ANALYST_COLS = ['analyst_count', 'np_yield', 'analyst_rev_30d']
 HOLDER_COLS  = ['holder_chg_qoq']
-ALL_FEATURES = TECH_COLS + BASIC_COLS + MF_COLS + FUND_COLS + ANALYST_COLS + HOLDER_COLS
+# 非线性交叉特征（从现有特征组合生成，在 build_panel 中计算）
+CROSS_COLS   = ['smart_momentum', 'momentum_adj_reversal', 'quality_value_score']
+ALL_FEATURES = TECH_COLS + BASIC_COLS + MF_COLS + FUND_COLS + ANALYST_COLS + HOLDER_COLS + CROSS_COLS
 
 
 # ─── 数据库连接 ───────────────────────────────────────────────────────────────
@@ -497,8 +499,9 @@ def load_analyst_features(conn, rebal_dates: list,
                           mv_map: dict) -> pd.DataFrame:
     """
     对每个调仓日，聚合过去 90 天的分析师预测（report_rc）。
-    返回: (ts_code, trade_date) → [analyst_count, np_yield]
+    返回: (ts_code, trade_date) → [analyst_count, np_yield, analyst_rev_30d]
     np_yield = 中位数预测净利润(万元) / 市值(万元) = 盈利收益率
+    analyst_rev_30d = 近30天预测中位数 / 31-90天前预测中位数 - 1 = 修正动量
     """
     print("  加载分析师预期特征...")
     rc_df = conn.execute("""
@@ -512,9 +515,15 @@ def load_analyst_features(conn, rebal_dates: list,
     results = []
     for rd in rebal_dates:
         rd_str = str(rd)
-        win_start = _shift_date_str(rd_str, -90)
-        mask = (rc_df["report_date"] >= win_start) & (rc_df["report_date"] <= rd_str)
-        subset = rc_df[mask]
+        win_start    = _shift_date_str(rd_str, -90)
+        recent_start = _shift_date_str(rd_str, -30)
+        old_end      = _shift_date_str(rd_str, -31)
+
+        mask_all    = (rc_df["report_date"] >= win_start)    & (rc_df["report_date"] <= rd_str)
+        mask_recent = (rc_df["report_date"] >= recent_start) & (rc_df["report_date"] <= rd_str)
+        mask_old    = (rc_df["report_date"] >= win_start)    & (rc_df["report_date"] <= old_end)
+
+        subset = rc_df[mask_all]
         if subset.empty:
             continue
         agg = subset.groupby("ts_code")["np"].agg(
@@ -522,12 +531,23 @@ def load_analyst_features(conn, rebal_dates: list,
             np_median="median"
         ).reset_index()
         agg["trade_date"] = rd_str
+
+        # 分析师预期修正动量：近30天 vs 31-90天前预测中位数变化率
+        recent_np = rc_df[mask_recent].groupby("ts_code")["np"].median().rename("recent_np")
+        old_np    = rc_df[mask_old   ].groupby("ts_code")["np"].median().rename("old_np")
+        rev = pd.concat([recent_np, old_np], axis=1)
+        rev["analyst_rev_30d"] = (
+            rev["recent_np"] / rev["old_np"].replace(0, np.nan) - 1
+        ).clip(-1.0, 2.0)
+        agg = agg.merge(rev[["analyst_rev_30d"]].reset_index(),
+                        on="ts_code", how="left")
+
         results.append(agg)
 
     if not results:
         print("    ⚠ 无分析师数据")
         return pd.DataFrame(columns=["ts_code", "trade_date",
-                                     "analyst_count", "np_yield"])
+                                     "analyst_count", "np_yield", "analyst_rev_30d"])
 
     analyst_df = pd.concat(results, ignore_index=True)
 
@@ -632,6 +652,113 @@ def join_holder_pit(holder_df: pd.DataFrame, rebal_keys: pd.DataFrame) -> pd.Dat
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# 5c. 盈利超预期（SUE）= 实际净利润 vs 公告前分析师一致预期
+# ════════════════════════════════════════════════════════════════════════════
+def load_sue_features(conn) -> pd.DataFrame:
+    """
+    SUE = (actual_np - consensus_np) / abs(consensus_np)
+    consensus_np = 公告前5天至180天内的分析师预测中位数（同一季度）
+    返回: (ts_code, f_ann_date, sue)
+    """
+    print("  计算SUE（盈利超预期）...")
+
+    is_df = conn.execute("""
+        WITH is_t AS (
+            SELECT ts_code, end_date,
+                   MIN(COALESCE(f_ann_date, ann_date)) AS f_ann_date,
+                   FIRST(n_income_attr_p ORDER BY ann_date DESC) AS actual_np
+            FROM income_statement
+            WHERE comp_type = '1'
+            GROUP BY ts_code, end_date
+        )
+        SELECT * FROM is_t
+        WHERE f_ann_date >= '20160101' AND actual_np IS NOT NULL
+    """).fetchdf()
+    is_df["f_ann_date"] = is_df["f_ann_date"].astype(str)
+    is_df["end_date"]   = is_df["end_date"].astype(str)
+
+    month_to_q = {"03": "Q1", "06": "Q2", "09": "Q3", "12": "Q4"}
+    is_df["quarter"] = is_df["end_date"].str[:4] + is_df["end_date"].str[4:6].map(month_to_q)
+    is_df = is_df[is_df["quarter"].notna()].copy()
+
+    rc_df = conn.execute("""
+        SELECT ts_code, report_date, quarter, np
+        FROM report_rc
+        WHERE np IS NOT NULL AND np > 0
+    """).fetchdf()
+    rc_df["report_date"] = rc_df["report_date"].astype(str)
+
+    merged = is_df.merge(rc_df, on=["ts_code", "quarter"])
+    ann_dt  = pd.to_datetime(merged["f_ann_date"], format="%Y%m%d", errors="coerce")
+    rep_dt  = pd.to_datetime(merged["report_date"], format="%Y%m%d", errors="coerce")
+    days_before = (ann_dt - rep_dt).dt.days
+    merged = merged[(days_before >= 5) & (days_before <= 180)].copy()
+
+    consensus = merged.groupby(["ts_code", "end_date", "f_ann_date", "actual_np"])["np"].agg(
+        consensus_median="median", n_analysts="count"
+    ).reset_index()
+    consensus = consensus[consensus["n_analysts"] >= 2].copy()
+
+    consensus["sue"] = (
+        (consensus["actual_np"] - consensus["consensus_median"]) /
+        consensus["consensus_median"].abs().replace(0, np.nan)
+    ).clip(-2.0, 2.0)
+
+    sue_df = consensus[["ts_code", "f_ann_date", "sue"]].copy()
+    print(f"    SUE特征: {len(sue_df):,} 条 ({sue_df['ts_code'].nunique()} 只股票)")
+    return sue_df
+
+
+def join_sue_pit(sue_df: pd.DataFrame, rebal_keys: pd.DataFrame,
+                 max_lag_days: int = 90) -> pd.DataFrame:
+    """PIT join SUE，有效期 max_lag_days 天（超过则置 NaN）"""
+    if sue_df.empty:
+        rebal_keys = rebal_keys.copy()
+        rebal_keys["sue"] = np.nan
+        return rebal_keys
+
+    print("  PIT合并SUE数据...")
+    keys = rebal_keys[["ts_code", "trade_date"]].copy()
+    keys["_td_int"] = keys["trade_date"].astype(str).str.replace("-", "").astype(int)
+
+    sue_df = sue_df.copy()
+    sue_df["_ann_int"] = sue_df["f_ann_date"].str.replace("-", "").astype(int)
+
+    sue_grouped = {ts: grp.sort_values("_ann_int").reset_index(drop=True)
+                   for ts, grp in sue_df.groupby("ts_code")}
+
+    results = []
+    for ts_code, keys_grp in keys.groupby("ts_code"):
+        keys_grp = keys_grp.copy()
+        if ts_code not in sue_grouped:
+            keys_grp["sue"] = np.nan
+        else:
+            sg   = sue_grouped[ts_code]
+            ann  = sg["_ann_int"].values
+            tds  = keys_grp["_td_int"].values
+            idxs = np.searchsorted(ann, tds, side="right") - 1
+            valid = idxs >= 0
+
+            sue_vals = sg["sue"].values
+            ann_vals = sg["_ann_int"].values
+            matched_ann = np.where(valid, ann_vals[np.maximum(idxs, 0)], 0)
+
+            td_dt  = pd.to_datetime(keys_grp["trade_date"].astype(str), format="%Y%m%d")
+            ann_dt = pd.to_datetime(pd.Series(matched_ann).astype(str).replace("0", "19700101"),
+                                    format="%Y%m%d")
+            days_since = (td_dt.values - ann_dt.values) / np.timedelta64(1, "D")
+            still_valid = valid & (days_since <= max_lag_days)
+
+            keys_grp["sue"] = np.where(still_valid, sue_vals[np.maximum(idxs, 0)], np.nan)
+        results.append(keys_grp.drop(columns=["_td_int"]))
+
+    result = pd.concat(results, ignore_index=True)
+    n_matched = result["sue"].notna().sum()
+    print(f"    SUE PIT匹配: {n_matched:,} / {len(result):,} 条")
+    return result
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # 6. 标签：10日超额收益（前向，相对沪深300）
 # ════════════════════════════════════════════════════════════════════════════
 def compute_labels(close_pivot: pd.DataFrame, conn,
@@ -724,7 +851,8 @@ def build_panel(tech_df: pd.DataFrame,
                 label_df: pd.DataFrame,
                 stock_info: pd.DataFrame,
                 rebal_dates: list,
-                holder_pit: pd.DataFrame = None) -> pd.DataFrame:
+                holder_pit: pd.DataFrame = None,
+                sue_pit: pd.DataFrame = None) -> pd.DataFrame:
     """
     合并所有特征和标签为一个 Panel DataFrame。
     键: (ts_code, trade_date)
@@ -776,8 +904,9 @@ def build_panel(tech_df: pd.DataFrame,
     if not analyst_df.empty:
         base = base.merge(analyst_df, on=["ts_code", "trade_date"], how="left")
     else:
-        base["analyst_count"] = np.nan
-        base["np_yield"]      = np.nan
+        base["analyst_count"]   = np.nan
+        base["np_yield"]        = np.nan
+        base["analyst_rev_30d"] = np.nan
 
     # 5b. 加股东户数（holder_chg_qoq）
     if holder_pit is not None and not holder_pit.empty and "holder_chg_qoq" in holder_pit.columns:
@@ -785,6 +914,19 @@ def build_panel(tech_df: pd.DataFrame,
                           on=["ts_code", "trade_date"], how="left")
     else:
         base["holder_chg_qoq"] = np.nan
+
+    # 5c. SUE（盈利超预期，PEAD因子）
+    if sue_pit is not None and not sue_pit.empty and "sue" in sue_pit.columns:
+        base = base.merge(sue_pit[["ts_code", "trade_date", "sue"]],
+                          on=["ts_code", "trade_date"], how="left")
+    else:
+        base["sue"] = np.nan
+
+    # 5d. 非线性交叉特征（F2/F3/F4）
+    base["smart_momentum"] = base["ret_20d"] * base["large_net_20d_ratio"]
+    base["momentum_adj_reversal"] = base["ret_60d"] - base["ret_5d"]
+    pe_safe = base["pe_ttm"].clip(lower=5.0)
+    base["quality_value_score"] = base["ni_growth_yoy"] / pe_safe
 
     # 6. 加行业信息（用于中性化）
     base = base.merge(stock_info, on="ts_code", how="left")
@@ -868,7 +1010,8 @@ def preprocess_panel(panel: pd.DataFrame,
 
         if neutralize and len(grp) > 20:
             neut_cols = [c for c in feature_cols
-                         if c not in ("log_mktcap", "fscore", "analyst_count")]
+                         if c not in ("log_mktcap", "fscore", "analyst_count",
+                                      "analyst_rev_30d", "sue")]
             grp = neutralize_cross_section(grp, neut_cols)
 
         for col in feature_cols:
@@ -1266,6 +1409,11 @@ def main():
         holder_df  = load_holder_features(conn)
         holder_pit = join_holder_pit(holder_df, rebal_keys)
 
+        # ── Step 6c: SUE（盈利超预期）────────────────────────────────────
+        print("\n[Step 6c] SUE 盈利超预期特征")
+        sue_df  = load_sue_features(conn)
+        sue_pit = join_sue_pit(sue_df, rebal_keys, max_lag_days=90)
+
         # ── Step 7: 标签 ─────────────────────────────────────────────────
         print("\n[Step 7] 计算 10 日超额收益标签")
         label_df = compute_labels(close_pivot, conn, rebal_dates)
@@ -1285,6 +1433,7 @@ def main():
         stock_info=stock_info,
         rebal_dates=rebal_dates,
         holder_pit=holder_pit,
+        sue_pit=sue_pit,
     )
 
     # 检查各特征的非空率

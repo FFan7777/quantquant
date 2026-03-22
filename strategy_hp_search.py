@@ -694,8 +694,8 @@ def sensitivity_test(best_p: StrategyParams,
     print(f"  基准 minimax={base_score:.3f}  params={best_p}")
 
     dims = {
-        "max_slots":        [4, 6, 8, 10, 12],
-        "half_slots":       [2, 3, 4, 5],
+        "max_slots":        [4, 6, 8, 10, 12, 15],
+        "half_slots":       [2, 3, 4, 5, 6],
         "stop_loss":        [0.05, 0.06, 0.07, 0.08, 0.10, 0.12],
         "bull_ma_death":    [4, 5, 6, 7, 9, 12],
         "bull_min_hold":    [4, 5, 6, 7, 9, 12],
@@ -840,7 +840,8 @@ def main():
     # ── Step A: (max_slots, half_slots) ───────────────────────────────
     slot_overrides = [
         {'max_slots': ms, 'half_slots': hs}
-        for ms, hs in [(4,2), (6,2), (6,3), (8,2), (8,3), (8,4), (10,3), (10,4), (10,5)]
+        for ms, hs in [(4,2), (6,2), (6,3), (8,2), (8,3), (8,4), (10,3), (10,4), (10,5),
+                       (12,4), (12,5), (15,5), (15,6)]
     ]
     best_p, res_A = search_dimension(
         "max_slots × half_slots", slot_overrides, DEFAULT_PARAMS,
