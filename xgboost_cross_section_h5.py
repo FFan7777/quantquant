@@ -31,6 +31,7 @@ Changelog:
 import os
 import sys
 import time
+import gc
 import warnings
 
 import duckdb
@@ -39,6 +40,7 @@ import pandas as pd
 from scipy import stats
 from sklearn.linear_model import Ridge
 import xgboost as xgb
+import lightgbm as lgb
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -57,10 +59,15 @@ TRAIN_END     = "20211231"           # Train: 2018-2021（4年）
 VAL_START     = "20220201"           # Val: 2022-2024（3年，含2022熊市，多周期验证）
 VAL_END       = "20241231"
 TEST_START    = "20250201"           # Test: 2025+（VAL_END后+20交易日隔离）
-END_DATE      = "20260316"           # 数据终点（当前最新）
+END_DATE      = "20260417"           # 数据终点（当前最新）
 EMBARGO_DAYS  = 20                   # 隔离期（交易日数）
 MIN_MKTCAP    = 2.0                  # 最小市值过滤（亿元）[从5.0降至2.0，捕获更多小盘alpha]
 OUTPUT_DIR    = "output"
+
+# ── 排序学习 & 时序样本权重 ────────────────────────────────────────────────
+RANKING_MODE     = False   # True: rank:ndcg 行业分桶; False: reg:squarederror（基线）
+TIME_DECAY_ALPHA = 0.0     # 0.0=等权, 0.5=温和加权近期, 1.0=强加权
+ENSEMBLE_LGB     = True    # True: XGB+LGB rank-average ensemble（与H10设计对称）
 
 # 特征列名
 # 规则松弛说明:
@@ -75,7 +82,8 @@ TECH_COLS   = ['ret_1d', 'ret_5d', 'ret_20d', 'ret_60d', 'ret_120d',
                # Alpha158 扩充特征（剔除 skew_20d importance=0.69% 噪声）
                'amplitude_1d', 'open_vs_close',
                'dist_from_high_5d', 'dist_from_low_5d', 'dist_from_high_20d',
-               'high_low_ratio_20d', 'vol_ratio_5_20']
+               'high_low_ratio_20d', 'vol_ratio_5_20',
+               ]
 BASIC_COLS  = ['pe_ttm', 'pb', 'log_mktcap', 'turnover_20d', 'volume_ratio', 'dv_ratio']
 MF_COLS     = ['mf_1d_mv', 'mf_5d_mv', 'mf_20d_mv',
                'large_net_5d_ratio', 'large_net_20d_ratio',
@@ -127,7 +135,8 @@ def load_tech_basic_features(conn) -> pd.DataFrame:
     print("  加载技术面 & 估值特征（SQL窗口函数）...")
     df = conn.execute(f"""
         WITH dp AS (
-            SELECT ts_code, trade_date, open, high, low, close, pre_close, pct_chg, vol
+            SELECT ts_code, trade_date, open, high, low, close, pre_close, pct_chg, vol,
+                   amount, adj_factor
             FROM daily_price
             WHERE trade_date >= '{DATA_START}' AND trade_date <= '{END_DATE}'
               AND ts_code NOT LIKE '8%'
@@ -160,7 +169,7 @@ def load_tech_basic_features(conn) -> pd.DataFrame:
                                                               AS high_low_ratio_20d,
                 AVG(vol) OVER (w ROWS BETWEEN 4  PRECEDING AND CURRENT ROW) /
                   NULLIF(AVG(vol) OVER (w ROWS BETWEEN 19 PRECEDING AND CURRENT ROW), 0)
-                                                              AS vol_ratio_5_20
+                                                              AS vol_ratio_5_20,
             FROM dp
             WINDOW w AS (PARTITION BY ts_code ORDER BY trade_date)
         ),
@@ -922,7 +931,7 @@ def build_panel(tech_df: pd.DataFrame,
     else:
         base["sue"] = np.nan
 
-    # 5d. 非线性交叉特征（F2/F3/F4）
+    # 5e. 非线性交叉特征（F2/F3/F4）
     base["smart_momentum"] = base["ret_20d"] * base["large_net_20d_ratio"]
     base["momentum_adj_reversal"] = base["ret_60d"] - base["ret_5d"]
     pe_safe = base["pe_ttm"].clip(lower=5.0)
@@ -976,11 +985,11 @@ def neutralize_cross_section(df: pd.DataFrame,
     df = df.copy()
     industries = pd.get_dummies(df[industry_col], prefix="ind", drop_first=True, dtype=float)
     logmv = df[logmktcap_col].fillna(df[logmktcap_col].median())
-    X_ctrl = pd.concat([logmv.rename("log_mktcap"), industries], axis=1).values.astype(float)
+    X_ctrl = pd.concat([logmv.rename("log_mktcap"), industries], axis=1).values.astype(np.float32)
 
     ridge = Ridge(alpha=1.0, fit_intercept=True)
     for col in factor_cols:
-        y = df[col].values.astype(float)
+        y = df[col].values.astype(np.float32)
         valid = ~np.isnan(y)
         if valid.sum() < 10:
             continue
@@ -1000,7 +1009,6 @@ def preprocess_panel(panel: pd.DataFrame,
     3. 截面 Z-score 标准化
     """
     print("  预处理: 去极值 → 中性化 → Z-score...")
-    panel = panel.copy()
 
     def process_group(grp):
         for col in feature_cols:
@@ -1060,23 +1068,154 @@ def split_purged(panel: pd.DataFrame) -> tuple:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 11. XGBoost 训练
+# 11. 排序学习辅助工具 & XGBoost 训练
 # ════════════════════════════════════════════════════════════════════════════
+
+class _BoosterWrapper:
+    """将 xgb.Booster（rank:ndcg）包装为 XGBRegressor 兼容接口"""
+    def __init__(self, booster: xgb.Booster, feature_names: list):
+        self._booster       = booster
+        self._feature_names = feature_names
+        self.best_iteration = getattr(booster, 'best_iteration',
+                                      booster.num_boosted_rounds())
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        return self._booster.predict(
+            xgb.DMatrix(X, feature_names=self._feature_names))
+
+    def save_model(self, path: str):
+        self._booster.save_model(path)
+
+    def get_booster(self) -> xgb.Booster:
+        return self._booster
+
+    @property
+    def feature_importances_(self) -> np.ndarray:
+        scores = self._booster.get_score(importance_type='gain')
+        return np.array([scores.get(f, 0.0) for f in self._feature_names], dtype=float)
+
+
+def compute_sample_weights(df: pd.DataFrame, alpha: float = 0.5) -> np.ndarray:
+    """指数时间衰减样本权重：近期数据权重更高"""
+    if alpha <= 0.0:
+        return np.ones(len(df), dtype=np.float32)
+    years = pd.to_datetime(df["trade_date"].astype(str),
+                           format="%Y%m%d").dt.year.values
+    min_y, max_y = int(years.min()), int(years.max())
+    if max_y == min_y:
+        return np.ones(len(df), dtype=np.float32)
+    norm = (years - min_y) / (max_y - min_y)
+    w = np.exp(alpha * norm)
+    return (w / w.mean()).astype(np.float32)
+
+
+def make_ranking_groups(df: pd.DataFrame) -> tuple:
+    """为 rank:ndcg 创建 (trade_date, industry) 行业分组"""
+    df = df.sort_values(["trade_date", "industry"]).reset_index(drop=True)
+    group_sizes = (
+        df.groupby(["trade_date", "industry"], sort=False, observed=True)
+          .size().values.tolist()
+    )
+    return df, group_sizes
+
+
+def _train_xgb_ranking(train: pd.DataFrame, feature_cols: list,
+                        val: pd.DataFrame = None,
+                        n_estimators: int = 2000) -> _BoosterWrapper:
+    """XGBoost rank:ndcg 行业分桶排序训练（H5）"""
+    print(f"\n[训练] XGBoost rank:ndcg  [RANKING+decay={TIME_DECAY_ALPHA}]")
+
+    train_sorted, group_sizes = make_ranking_groups(train)
+    X_tr = train_sorted[feature_cols].values.astype(np.float32)
+    y_tr = (train_sorted["label"].values * 100).clip(0, 100).astype(np.int32)
+
+    avg_g = np.mean(group_sizes)
+    print(f"  训练集: {train_sorted['trade_date'].min()} ~ {train_sorted['trade_date'].max()}, "
+          f"{len(train_sorted):,} 行, {len(group_sizes)} 分组 (avg={avg_g:.1f})")
+
+    # rank:ndcg weight 为每组一个（时间衰减：近期截面权重更高）
+    grp_dates = (
+        train_sorted.groupby(["trade_date", "industry"], sort=False, observed=True)
+        ["trade_date"].first().astype(str).values
+    )
+    if TIME_DECAY_ALPHA > 0.0:
+        grp_years = np.array([int(d[:4]) for d in grp_dates])
+        min_y, max_y = grp_years.min(), grp_years.max()
+        if max_y > min_y:
+            norm_g = (grp_years - min_y) / (max_y - min_y)
+            group_weights = np.exp(TIME_DECAY_ALPHA * norm_g).astype(np.float32)
+            group_weights = group_weights / group_weights.mean()
+        else:
+            group_weights = np.ones(len(group_sizes), dtype=np.float32)
+    else:
+        group_weights = np.ones(len(group_sizes), dtype=np.float32)
+
+    dtrain = xgb.DMatrix(X_tr, label=y_tr, feature_names=feature_cols,
+                          weight=group_weights)
+    dtrain.set_group(group_sizes)
+
+    xgb_params = {
+        'objective':        'rank:ndcg',
+        'ndcg_exp_gain':    False,   # 线性 NDCG（标签允许超过31，避免 exp 溢出）
+        'eval_metric':      'ndcg',
+        'max_depth':        4,
+        'min_child_weight': 30,
+        'reg_lambda':       10.0,
+        'learning_rate':    0.02,
+        'subsample':        0.7,
+        'colsample_bytree': 0.7,
+        'reg_alpha':        0.5,
+        'tree_method':      'hist',
+        'seed':             42,
+        'verbosity':        0,
+    }
+
+    evals, callbacks = [], []
+    if val is not None and len(val) > 0:
+        val_sorted, val_groups = make_ranking_groups(val)
+        X_val = val_sorted[feature_cols].values.astype(np.float32)
+        y_val = (val_sorted["label"].values * 100).clip(0, 100).astype(np.int32)
+        dval  = xgb.DMatrix(X_val, label=y_val, feature_names=feature_cols)
+        dval.set_group(val_groups)
+        evals     = [(dval, 'val')]
+        callbacks = [xgb.callback.EarlyStopping(
+            rounds=50, metric_name='ndcg', maximize=True, save_best=True)]
+        print(f"  验证集: {val_sorted['trade_date'].min()} ~ {val_sorted['trade_date'].max()}, "
+              f"{len(val_sorted):,} 行")
+
+    booster = xgb.train(
+        xgb_params, dtrain,
+        num_boost_round=n_estimators,
+        evals=evals,
+        callbacks=callbacks,
+        verbose_eval=200,
+    )
+    best_it = getattr(booster, 'best_iteration', booster.num_boosted_rounds())
+    print(f"  最优迭代: {best_it} 轮")
+    return _BoosterWrapper(booster, feature_names=feature_cols)
+
+
 def train_xgb(train: pd.DataFrame, feature_cols: list,
               val: pd.DataFrame = None,
-              n_estimators: int = 2000) -> xgb.XGBRegressor:
+              n_estimators: int = 2000):
     """
-    训练 XGBoost 截面排序模型（回归形式，label = 截面百分位排名）。
-    val: 用于 Early Stopping 的验证集（独立 DataFrame，不从 train 内部切分）。
+    训练 XGBoost 截面排序模型。
+    RANKING_MODE=True  → rank:ndcg 行业分桶（推荐）
+    RANKING_MODE=False → reg:squarederror（基线，用于 fallback）
     """
-    print("\n[训练] XGBoost 模型...")
+    if RANKING_MODE and "industry" in train.columns:
+        return _train_xgb_ranking(train, feature_cols, val, n_estimators)
 
-    X_tr = train[feature_cols].values.astype(float)
-    y_tr = train["label"].values.astype(float)
+    # ── 回归模式（fallback）────────────────────────────────────────────────
+    print("\n[训练] XGBoost 模型（reg:squarederror）...")
+
+    X_tr = train[feature_cols].values.astype(np.float32)
+    y_tr = train["label"].values.astype(np.float32)
+    sw   = compute_sample_weights(train, TIME_DECAY_ALPHA)
 
     if val is not None:
-        X_val = val[feature_cols].values.astype(float)
-        y_val = val["label"].values.astype(float)
+        X_val = val[feature_cols].values.astype(np.float32)
+        y_val = val["label"].values.astype(np.float32)
         print(f"  训练集: {train['trade_date'].min()} ~ {train['trade_date'].max()}, "
               f"{len(train):,} 行")
         print(f"  验证集(ES): {val['trade_date'].min()} ~ {val['trade_date'].max()}, "
@@ -1106,7 +1245,8 @@ def train_xgb(train: pd.DataFrame, feature_cols: list,
         eval_metric      = "rmse",
         verbosity        = 0,
     )
-    model.fit(X_tr, y_tr, eval_set=eval_set, verbose=100)
+    model.fit(X_tr, y_tr, eval_set=eval_set, verbose=100,
+              sample_weight=sw)
     if val is not None:
         print(f"  最优迭代: {model.best_iteration} 轮")
     else:
@@ -1114,20 +1254,85 @@ def train_xgb(train: pd.DataFrame, feature_cols: list,
     return model
 
 
+def train_lgbm_h5(train: pd.DataFrame, feature_cols: list,
+                  val: pd.DataFrame = None,
+                  n_estimators: int = 2000) -> lgb.Booster:
+    """LightGBM 截面选股（与H10设计对称，H5用等权样本）。"""
+    lgb_params = dict(
+        objective        = "regression",
+        metric           = "l2",
+        learning_rate    = 0.02,
+        num_leaves       = 15,           # 对应 depth≈4
+        min_child_samples= 40,
+        reg_lambda       = 10.0,
+        reg_alpha        = 0.5,
+        feature_fraction = 0.7,
+        bagging_fraction = 0.7,
+        bagging_freq     = 5,
+        verbose          = -1,
+        n_jobs           = -1,
+    )
+    X_tr = train[feature_cols].values.astype(np.float32)
+    y_tr = train["label"].values.astype(np.float32)
+    dtrain = lgb.Dataset(X_tr, label=y_tr, feature_name=feature_cols)
+    print(f"\n[训练] LightGBM(H5)  leaves=15  mcs=40  λ=10.0")
+    print(f"  训练集: {len(train):,} 行, {train['trade_date'].nunique()} 个截面")
+
+    if val is not None and len(val) > 0:
+        X_val = val[feature_cols].values.astype(np.float32)
+        y_val = val["label"].values.astype(np.float32)
+        dval  = lgb.Dataset(X_val, label=y_val, reference=dtrain)
+        print(f"  验证集: {len(val):,} 行, {val['trade_date'].nunique()} 个截面")
+        callbacks = [lgb.early_stopping(stopping_rounds=50, verbose=False),
+                     lgb.log_evaluation(period=200)]
+        model = lgb.train(lgb_params, dtrain, num_boost_round=n_estimators,
+                          valid_sets=[dval], callbacks=callbacks)
+    else:
+        model = lgb.train(lgb_params, dtrain, num_boost_round=n_estimators,
+                          callbacks=[lgb.log_evaluation(period=-1)])
+    print(f"  最优迭代: {model.best_iteration} 轮")
+    return model
+
+
+def ensemble_predict_h5(panel: pd.DataFrame,
+                        xgb_model, lgb_model,
+                        feature_cols: list,
+                        w_xgb: float = 0.5) -> np.ndarray:
+    """截面内 rank-average：XGB rank × w_xgb + LGB rank × (1-w_xgb)。"""
+    X = panel[feature_cols].values.astype(np.float32)
+    pred_xgb = xgb_model.predict(X)
+    pred_lgb = lgb_model.predict(X)
+    tmp = panel[["trade_date"]].copy()
+    tmp["p_xgb"] = pred_xgb
+    tmp["p_lgb"] = pred_lgb
+    tmp["r_xgb"] = tmp.groupby("trade_date")["p_xgb"].rank(pct=True)
+    tmp["r_lgb"] = tmp.groupby("trade_date")["p_lgb"].rank(pct=True)
+    return (w_xgb * tmp["r_xgb"] + (1 - w_xgb) * tmp["r_lgb"]).values
+
+
 def train_xgb_final(train: pd.DataFrame, val: pd.DataFrame,
                     feature_cols: list) -> tuple:
     """
-    两阶段最终训练，返回 (model_final, model_train_only)：
+    两阶段最终训练，返回 (xgb_final, xgb_train_only, lgb_final, lgb_train_only)：
     1. train-only 模型：在 train 上训练，用 val 做 ES → 供 val 期预测（PIT 正确）
     2. final 模型：在 train+val 合并数据上用相同轮数重训（无 ES） → 供推理使用
+    若 ENSEMBLE_LGB=False，lgb_* 返回 None。
     """
-    model_train_only = train_xgb(train, feature_cols, val=val, n_estimators=2000)
-    best_n = model_train_only.best_iteration
+    xgb_train_only = train_xgb(train, feature_cols, val=val, n_estimators=2000)
+    best_n = xgb_train_only.best_iteration
 
     train_val = pd.concat([train, val], ignore_index=True)
-    print(f"\n[训练 Final] train+val 合并，固定 {best_n} 轮（无 ES）...")
-    model_final = train_xgb(train_val, feature_cols, val=None, n_estimators=best_n)
-    return model_final, model_train_only
+    print(f"\n[训练 Final XGB] train+val 合并，固定 {best_n} 轮（无 ES）...")
+    xgb_final = train_xgb(train_val, feature_cols, val=None, n_estimators=best_n)
+
+    lgb_train_only, lgb_final = None, None
+    if ENSEMBLE_LGB:
+        lgb_train_only = train_lgbm_h5(train, feature_cols, val=val, n_estimators=2000)
+        lgb_best_n = lgb_train_only.best_iteration
+        print(f"\n[训练 Final LGB] train+val 合并，固定 {lgb_best_n} 轮（无 ES）...")
+        lgb_final = train_lgbm_h5(train_val, feature_cols, val=None, n_estimators=lgb_best_n)
+
+    return xgb_final, xgb_train_only, lgb_final, lgb_train_only
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1174,14 +1379,17 @@ def compute_gauc(df_eval: pd.DataFrame) -> float:
 
 
 def evaluate(panel: pd.DataFrame,
-             model: xgb.XGBRegressor,
+             model,
              feature_cols: list,
-             label: str = "TEST") -> dict:
-    """完整评估: Rank IC, ICIR, GAUC, 分层收益"""
-    X = panel[feature_cols].values.astype(float)
-    pred = model.predict(X)
-
+             label: str = "TEST",
+             lgb_model=None) -> dict:
+    """完整评估: Rank IC, ICIR, GAUC, 分层收益。lgb_model 非None时做截面rank-average。"""
     panel = panel.copy()
+    if lgb_model is not None:
+        pred = ensemble_predict_h5(panel, model, lgb_model, feature_cols)
+    else:
+        X = panel[feature_cols].values.astype(np.float32)
+        pred = model.predict(X)
     panel["pred"] = pred
 
     df_eval = pd.DataFrame({
@@ -1472,30 +1680,36 @@ def main():
     # ── Step 10: 训练/验证/测试分割 ──────────────────────────────────────
     print("\n[Step 10] Purged Train/Val/Test 切分")
     train, val, test = split_purged(panel)
+    del panel; gc.collect()
 
     # ── Step 11: 两阶段训练 ───────────────────────────────────────────────
     # model_train_only: 仅用 train(2018-2021) 训练 → 生成 val 期预测（PIT 正确）
     # model_final:      train+val(2018-2024) 合并训练 → 供 2025+ 推理使用
     print("\n[Step 11] 两阶段训练（train-only + final）")
-    model_final, model_train_only = train_xgb_final(train, val, avail_features)
+    xgb_final, xgb_train_only, lgb_final, lgb_train_only = train_xgb_final(train, val, avail_features)
 
     # ── Step 12: 评估 ─────────────────────────────────────────────────────
     print("\n[Step 12] 评估")
-    train_res = evaluate(train, model_train_only, avail_features, label="TRAIN(train-only)")
-    val_res   = evaluate(val,   model_train_only, avail_features, label="VAL(train-only)")
-    test_res  = evaluate(test,  model_final,      avail_features, label="TEST(final)")
+    train_res = evaluate(train, xgb_train_only, avail_features, label="TRAIN(train-only)",
+                         lgb_model=lgb_train_only)
+    val_res   = evaluate(val,   xgb_train_only, avail_features, label="VAL(train-only)",
+                         lgb_model=lgb_train_only)
+    test_res  = evaluate(test,  xgb_final,      avail_features, label="TEST(final)",
+                         lgb_model=lgb_final)
 
     # ── Step 13: 可视化 & 保存 ────────────────────────────────────────────
     print("\n[Step 13] 可视化 & 保存")
-    plot_results(train_res, test_res, model_final, avail_features)
+    plot_results(train_res, test_res, xgb_final, avail_features)
     save_predictions(test_res)   # → xgb_cs_pred_h5.csv（test 期，供回测/实盘）
 
     # 保存 Val 期预测（供 strategy_hp_search.py 使用）
     os.makedirs(f"{OUTPUT_DIR}/csv", exist_ok=True)
     val_pred_df = val.copy()
-    val_pred_df["pred"] = model_train_only.predict(
-        val[avail_features].values.astype(float)
-    )
+    if lgb_train_only is not None:
+        val_pred_df["pred"] = ensemble_predict_h5(val_pred_df, xgb_train_only,
+                                                  lgb_train_only, avail_features)
+    else:
+        val_pred_df["pred"] = xgb_train_only.predict(val[avail_features].values.astype(np.float32))
     val_pred_df[["ts_code", "trade_date", "pred", "excess_ret"]].to_csv(
         f"{OUTPUT_DIR}/csv/xgb_cs_pred_val_h5.csv", index=False
     )
@@ -1505,7 +1719,7 @@ def main():
     # 保存特征重要性
     feat_imp_df = pd.DataFrame({
         "feature":    avail_features,
-        "importance": model_final.feature_importances_,
+        "importance": xgb_final.feature_importances_,
     }).sort_values("importance", ascending=False)
     feat_imp_df.to_csv(f"{OUTPUT_DIR}/csv/xgb_feature_importance_h5.csv", index=False)
 
@@ -1513,10 +1727,13 @@ def main():
     import json
     models_dir = f"{OUTPUT_DIR}/models"
     os.makedirs(models_dir, exist_ok=True)
-    model_final.save_model(f"{models_dir}/xgb_h{HORIZON}.json")
+    xgb_final.save_model(f"{models_dir}/xgb_h{HORIZON}.json")
+    if lgb_final is not None:
+        lgb_final.save_model(f"{models_dir}/lgb_h{HORIZON}.txt")
     with open(f"{models_dir}/features_h{HORIZON}.json", "w") as f:
-        json.dump({"features": avail_features, "train_end": VAL_END}, f, indent=2)
-    print(f"  模型已保存: {models_dir}/xgb_h{HORIZON}.json  (final: train+val 2018-2024)")
+        json.dump({"features": avail_features, "train_end": VAL_END,
+                   "ensemble_lgb": lgb_final is not None}, f, indent=2)
+    print(f"  模型已保存: {models_dir}/xgb_h{HORIZON}.json + lgb_h{HORIZON}.txt  (final: train+val 2018-2024)")
 
     elapsed = time.time() - t_total
     print(f"\n{'='*60}")

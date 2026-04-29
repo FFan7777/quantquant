@@ -20,7 +20,7 @@ class TushareAPI:
         # 设置自定义 API 地址（用于访问券商一致预期数据）
         if config.use_custom_api:
             self.pro._DataApi__token = config.tushare_token
-            self.pro._DataApi__http_url = 'http://118.25.178.42:5000'
+            self.pro._DataApi__http_url = 'https://tushare.data.godscode.com.cn'
 
         self.last_request_time = 0
         self.request_interval = config.request_interval

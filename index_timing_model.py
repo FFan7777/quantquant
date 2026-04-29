@@ -139,12 +139,16 @@ SELECTED_FEATURES = [
     'close_vs_ma20', 'close_vs_ma60', 'close_vs_ma120', 'close_vs_ma250',
     # 市场宽度
     'breadth_pct_ma20',
-    # 宏观信号
+    # 宏观信号（基础）
     'm2_yoy', 'pmi_vs_50', 'shibor_3m',
-    # 北向资金（20日累积）
-    'north_20d',
+    # 北向资金
+    'north_20d', 'north_accel',
     # 季节性编码
     'month_sin', 'month_cos',
+    # ── 新增宏观信号 ────────────────────────────────────────────────────
+    'shibor_slope',         # 利率期限斜率（1Y-3M）：正斜率=正常，负斜率=流动性压力
+    'pmi_new_order_vs50',   # PMI新订单偏差：领先PMI约1个月，更早反映需求变化
+    'cpi_ppi_spread',       # CPI-PPI剪刀差：正值=消费回暖，负值=企业利润压缩
 ]
 
 
@@ -170,7 +174,7 @@ def load_index_features(conn, cfg: Config) -> pd.DataFrame:
     """
     print("  加载指数日线...")
     df = conn.execute(f"""
-        SELECT trade_date, close, pct_chg, vol, amount
+        SELECT trade_date, open, high, low, close, pct_chg, vol, amount
         FROM index_daily
         WHERE ts_code = '{cfg.index_code}'
           AND trade_date >= '{cfg.data_start}'
@@ -208,6 +212,17 @@ def load_index_features(conn, cfg: Config) -> pd.DataFrame:
 
     # 成交量比（当日 / 20日均量）
     f['vol_ratio_20d'] = vol / vol.rolling(20).mean()
+
+    # ATR（真实波动幅度）：用于动态阈值调整，不作为模型特征
+    prev_close = close.shift(1)
+    atr_daily  = pd.concat([
+        df['high'] - df['low'],
+        (df['high'] - prev_close).abs(),
+        (df['low']  - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    atr_20d    = atr_daily.rolling(20).mean()
+    atr_252d   = atr_daily.rolling(252).mean()
+    f['atr_ratio'] = (atr_20d / atr_252d.replace(0, np.nan)).fillna(1.0)  # 短期/长期ATR比
 
     # 季节性编码（月份 sin/cos）
     idx_dt = pd.to_datetime(df.index, format='%Y%m%d')
@@ -290,7 +305,7 @@ def load_macro_features(conn, cfg: Config, trading_dates: List[str]) -> pd.DataF
     hsgt = hsgt[['north_1d', 'north_5d', 'north_20d', 'south_money', 'north_accel']]
 
     # ── PMI（月度，YYYYMM）──────────────────────────────────────────────
-    pmi_raw = conn.execute("SELECT month, pmi FROM cn_pmi ORDER BY month").fetchdf()
+    pmi_raw = conn.execute("SELECT month, pmi, pmi_new_order FROM cn_pmi ORDER BY month").fetchdf()
     # 保守处理：PMI 发布月 M → 从下月第 1 个交易日起可用
     # 将 YYYYMM → 下个月的 YYYYMM01 字符串，再 ffill 到日历
     def next_month_str(yyyymm: str) -> str:
@@ -302,7 +317,8 @@ def load_macro_features(conn, cfg: Config, trading_dates: List[str]) -> pd.DataF
 
     pmi_raw['avail_from'] = pmi_raw['month'].astype(str).apply(next_month_str)
     pmi_raw['pmi_vs_50']  = pmi_raw['pmi'] - 50.0
-    pmi_raw = pmi_raw.set_index('avail_from')[['pmi', 'pmi_vs_50']]
+    pmi_raw['pmi_new_order_vs50'] = pmi_raw['pmi_new_order'] - 50.0
+    pmi_raw = pmi_raw.set_index('avail_from')[['pmi', 'pmi_vs_50', 'pmi_new_order_vs50']]
 
     # ── M2（月度）───────────────────────────────────────────────────────
     m2_raw = conn.execute("SELECT month, m2_yoy FROM cn_m ORDER BY month").fetchdf()
@@ -311,37 +327,55 @@ def load_macro_features(conn, cfg: Config, trading_dates: List[str]) -> pd.DataF
 
     # ── SHIBOR（日度，date 列）──────────────────────────────────────────
     shibor = conn.execute(f"""
-        SELECT date AS trade_date, m3 AS shibor_3m
+        SELECT date AS trade_date, m3 AS shibor_3m, y1 AS shibor_1y
         FROM shibor
         WHERE date >= '{cfg.data_start}' AND date <= '{cfg.end_date}'
         ORDER BY date
     """).fetchdf()
     shibor['trade_date'] = shibor['trade_date'].astype(str)
-    shibor = shibor.set_index('trade_date')[['shibor_3m']]
+    shibor['shibor_slope'] = shibor['shibor_1y'] - shibor['shibor_3m']  # 利率期限斜率
+    shibor = shibor.set_index('trade_date')[['shibor_3m', 'shibor_slope']]
+
+    # ── CPI / PPI（月度）────────────────────────────────────────────────
+    cpi_raw = conn.execute("SELECT month, nt_yoy AS cpi_yoy FROM cn_cpi ORDER BY month").fetchdf()
+    cpi_raw['avail_from'] = cpi_raw['month'].astype(str).apply(next_month_str)
+    cpi_raw = cpi_raw.set_index('avail_from')[['cpi_yoy']]
+
+    ppi_raw = conn.execute("SELECT month, ppi_yoy FROM cn_ppi ORDER BY month").fetchdf()
+    ppi_raw['avail_from'] = ppi_raw['month'].astype(str).apply(next_month_str)
+    ppi_raw = ppi_raw.set_index('avail_from')[['ppi_yoy']]
 
     # ── 拼到交易日历 ────────────────────────────────────────────────────
     macro = pd.DataFrame(index=trading_dates)
 
     # 月度数据：以 YYYYMM01 为 key，将 macro 行索引取前 6 位作月份 key
     # 构建月度映射 dict，再 map → ffill
-    pmi_pmi_dict   = pmi_raw['pmi'].to_dict()
-    pmi_vs50_dict  = pmi_raw['pmi_vs_50'].to_dict()
-    m2_dict        = m2_raw['m2_yoy'].to_dict()
+    pmi_pmi_dict      = pmi_raw['pmi'].to_dict()
+    pmi_vs50_dict     = pmi_raw['pmi_vs_50'].to_dict()
+    pmi_neworder_dict = pmi_raw['pmi_new_order_vs50'].to_dict()
+    m2_dict           = m2_raw['m2_yoy'].to_dict()
+    cpi_dict          = cpi_raw['cpi_yoy'].to_dict()
+    ppi_dict          = ppi_raw['ppi_yoy'].to_dict()
 
     # 将交易日转为 YYYYMM01（方便 lookup）
     def date_to_month01(d: str) -> str:
         return d[:6] + '01'
 
     macro['_month01'] = [date_to_month01(d) for d in macro.index]
-    macro['pmi']       = macro['_month01'].map(pmi_pmi_dict)
-    macro['pmi_vs_50'] = macro['_month01'].map(pmi_vs50_dict)
-    macro['m2_yoy']    = macro['_month01'].map(m2_dict)
+    macro['pmi']                 = macro['_month01'].map(pmi_pmi_dict)
+    macro['pmi_vs_50']           = macro['_month01'].map(pmi_vs50_dict)
+    macro['pmi_new_order_vs50']  = macro['_month01'].map(pmi_neworder_dict)
+    macro['m2_yoy']              = macro['_month01'].map(m2_dict)
+    macro['cpi_yoy']             = macro['_month01'].map(cpi_dict)
+    macro['ppi_yoy']             = macro['_month01'].map(ppi_dict)
     macro = macro.drop(columns=['_month01'])
-    macro[['pmi', 'pmi_vs_50', 'm2_yoy']] = macro[['pmi', 'pmi_vs_50', 'm2_yoy']].ffill()
+    monthly_cols = ['pmi', 'pmi_vs_50', 'pmi_new_order_vs50', 'm2_yoy', 'cpi_yoy', 'ppi_yoy']
+    macro[monthly_cols] = macro[monthly_cols].ffill()
+    macro['cpi_ppi_spread'] = macro['cpi_yoy'] - macro['ppi_yoy']  # CPI-PPI剪刀差
 
     # 日度数据：左连接
     macro = macro.join(shibor, how='left')
-    macro['shibor_3m'] = macro['shibor_3m'].ffill()
+    macro[['shibor_3m', 'shibor_slope']] = macro[['shibor_3m', 'shibor_slope']].ffill()
     macro = macro.join(hsgt, how='left')
     macro[hsgt.columns] = macro[hsgt.columns].ffill()
 
@@ -1063,7 +1097,27 @@ def save_predictions(
     os.makedirs(os.path.join(cfg.output_dir, 'csv'), exist_ok=True)
 
     def _slots_with_ma(trade_date: str, prob: float) -> int:
-        s = prob_to_slots(prob, cfg)
+        # ── 动态阈值（ATR波动率调整）──────────────────────────────────────
+        # 高波动环境（短期ATR > 1.5倍长期均值）→ 提高满仓置信度要求
+        # 低波动环境（短期ATR < 0.8倍长期均值）→ 降低满仓置信度要求
+        tf = cfg.threshold_full
+        th = cfg.threshold_half
+        if trade_date in panel.index and 'atr_ratio' in panel.columns:
+            atr_r = panel.at[trade_date, 'atr_ratio']
+            if np.isfinite(atr_r):
+                if atr_r > 1.5:    # 高波动：需更高置信度
+                    tf, th = min(tf + 0.05, 0.80), min(th + 0.05, 0.65)
+                elif atr_r < 0.8:  # 低波动：可适度放宽
+                    tf, th = max(tf - 0.05, 0.50), max(th - 0.05, 0.35)
+
+        # 基于动态阈值生成槽位
+        if prob >= tf:
+            s = cfg.slots_full
+        elif prob >= th:
+            s = cfg.slots_half
+        else:
+            s = cfg.slots_empty
+
         if trade_date not in panel.index or cfg.ma_override == 'none':
             return s
         ma20_dev = panel.at[trade_date, 'close_vs_ma20'] if 'close_vs_ma20' in panel.columns else np.nan

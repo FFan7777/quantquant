@@ -68,12 +68,16 @@ from data_collect.config import config
 
 DB_PATH        = config.db_path
 BACKTEST_START = '20220101'   # val predictions start 20220210; test 20250210
-BACKTEST_END   = '20260316'
+BACKTEST_END   = '20260417'
 
 # 持仓槽位（权重 = 总净值 / MAX_SLOTS，固定不变）
-MAX_SLOTS     = 8      # 满仓最大持股（OOS 实测最优，HP搜索常过拟合 val）
-HALF_SLOTS    = 3      # 半仓最大持股（OOS 实测最优）
+MAX_SLOTS     = 8      # 满仓最大持股
+HALF_SLOTS    = 3      # 半仓最大持股
 BEAR_SLOTS    = 0    # 熊市（slots=0）时不主动调仓（=0禁用），持仓由风控自然退出
+
+# H10/H5 ensemble 权重（val期扫参：80/20 val夏普0.720最优）
+H10_WEIGHT    = 0.80
+H5_WEIGHT     = 0.20
 
 # 个股风控参数
 STOP_LOSS_ENTRY   = 0.10   # 距入场价回撤 10% → 硬止损（Val Minimax 最优）
@@ -161,7 +165,7 @@ def load_index_timing_slots() -> pd.Series:
         close_CSI300 < MA20 → 0
         MA20 ≤ close < MA60 → 10
         close ≥ MA60 + ML看涨 → 20
-      因此本策略不需要再做 MA regime 判断。
+
     """
     if not INDEX_TIMING_FILE.exists():
         raise FileNotFoundError(
@@ -213,8 +217,8 @@ def load_cs_predictions() -> pd.DataFrame:
                       on=['ts_code', 'trade_date'], how='inner')
         df['r10'] = df.groupby('trade_date')['pred'].rank(pct=True)
         df['r5']  = df.groupby('trade_date')['pred_h5'].rank(pct=True)
-        df['pred'] = 0.70 * df['r10'] + 0.30 * df['r5']
-        print(f"  截面选股 [H10+H5 ensemble 70/30]: {len(df):,} 行  "
+        df['pred'] = H10_WEIGHT * df['r10'] + H5_WEIGHT * df['r5']
+        print(f"  截面选股 [H10+H5 ensemble {int(H10_WEIGHT*100)}/{int(H5_WEIGHT*100)}]: {len(df):,} 行  "
               f"{df['trade_date'].nunique()} 个调仓日  "
               f"{df['ts_code'].nunique()} 只股票")
     else:
@@ -513,6 +517,23 @@ def daily_stop_check(
 # 8. 调仓
 # ══════════════════════════════════════════════════════════════════════
 
+def solve_erc(cov: np.ndarray, max_iter: int = 200, tol: float = 1e-8) -> np.ndarray:
+    """等边际风险贡献（ERC）权重，迭代算法（Maillard et al. 2010）"""
+    n = len(cov)
+    w = np.ones(n) / n
+    for _ in range(max_iter):
+        sigma = np.sqrt(w @ cov @ w)
+        if sigma < 1e-10:
+            return np.ones(n) / n
+        grad = (cov @ w) / sigma
+        w_new = w / grad
+        w_new = w_new / w_new.sum()
+        if np.max(np.abs(w_new - w)) < tol:
+            return np.clip(w_new, 0.05 / n, 0.95)
+        w = w_new
+    return np.clip(w, 0.05 / n, 0.95)
+
+
 def rebalance(
     portfolio: Portfolio,
     target_stocks: List[str],
@@ -522,6 +543,8 @@ def rebalance(
     slot_confirmed: bool = True,
     ret_vol: pd.Series = None,
     exec_prices: pd.Series = None,   # T+1 开盘价，用于实际成交；None 则退化到 T 收盘
+    ret_hist: pd.DataFrame = None,   # 近20日收益率矩阵，用于 ERC 协方差估计
+    pred_scores: dict = None,        # ts_code → 原始预测分数，用于分数比例仓位
 ) -> int:
     """
     按 CS 模型打分排列的 target_stocks 调仓。
@@ -1008,11 +1031,32 @@ def plot_results(
 # ══════════════════════════════════════════════════════════════════════
 
 def main():
+    import argparse
+    global MAX_SLOTS, HALF_SLOTS
+
+    parser = argparse.ArgumentParser(description='指数择时 + 截面选股联合回测')
+    parser.add_argument('--max_slots',  type=int, default=MAX_SLOTS,
+                        help=f'满仓最大持股数 (default={MAX_SLOTS})')
+    parser.add_argument('--half_slots', type=int, default=HALF_SLOTS,
+                        help=f'半仓最大持股数 (default={HALF_SLOTS})')
+    parser.add_argument('--sweep', action='store_true',
+                        help='对 max_slots=[4,5,6,7,8] 做横扫对比，忽略 --max_slots')
+    parser.add_argument('--sweep_weight', action='store_true',
+                        help='对 H10/H5 ensemble 权重做横扫对比')
+    args = parser.parse_args()
+
+    # 允许命令行覆盖全局参数
+    if not args.sweep:
+        MAX_SLOTS  = args.max_slots
+        HALF_SLOTS = args.half_slots
+
     print("=" * 60)
     print("  指数择时 + 截面选股  联合量化策略回测")
     print("  择时: CSI300 ma60_state（大盘 MA 状态）")
     print("  选股: XGBoost 截面超额收益预测")
     print(f"  回测: {BACKTEST_START} ~ {BACKTEST_END}")
+    if not args.sweep:
+        print(f"  MAX_SLOTS={MAX_SLOTS}  HALF_SLOTS={HALF_SLOTS}")
     print("=" * 60)
 
     # 1. 加载指数择时信号
@@ -1050,6 +1094,87 @@ def main():
 
     # 5b. CSI300 入场动量过滤
     csi300_mom = load_csi300_momentum()
+
+    # ── MAX_SLOTS 横扫模式 ────────────────────────────────────────────────
+    if args.sweep:
+        sweep_vals = [4, 5, 6, 7, 8]
+        sweep_rows = []
+        # 验证期：2023-2024；测试期：2025+（严格OOS，只用于事后对比，不参与选参）
+        VAL_END   = '2024-12-31'
+        TEST_START = '2025-01-01'
+        print("\n[SWEEP] MAX_SLOTS 横扫对比  (HALF_SLOTS = MAX_SLOTS // 2)")
+        print(f"  参数选择依据：验证期 2023-2024 年化收益 & 夏普（不得使用2025列选参）")
+        print(f"  {'slots':>5}  {'val年化':>7}  {'val夏普':>6}  {'valMaxDD':>8}  "
+              f"{'2023':>7}  {'2024':>7}  {'OOS2025':>8}")
+        for ms in sweep_vals:
+            MAX_SLOTS  = ms
+            HALF_SLOTS = max(1, ms // 2)
+            eq, _ = run_backtest(
+                price_pv, ma5_pv, ma20_pv, vol_pv,
+                cs_preds, index_slots, eligible, rebal_set,
+                csi300_mom=csi300_mom, retvol20_pv=retvol20_pv,
+                open_pv=open_pv, pct_chg_pv=pct_chg_pv,
+            )
+            # 验证期指标（选参依据）
+            eq_val  = eq[eq.index <= VAL_END]
+            met_val = compute_metrics(eq_val) if len(eq_val) > 20 else {}
+            # 测试期指标（事后查看，不参与选参）
+            eq_test = eq[eq.index >= TEST_START]
+            # per-year returns
+            yr = {}
+            for y in [2023, 2024, 2025]:
+                sub = eq[eq.index.year == y]
+                yr[y] = (sub['total_value'].iloc[-1] / sub['total_value'].iloc[0] - 1) * 100 if len(sub) > 1 else 0
+            oos = yr.get(2025, 0)
+            print(f"  {ms:>5}  {met_val.get('annual_ret',0)*100:>6.1f}%  "
+                  f"{met_val.get('sharpe',0):>6.3f}  "
+                  f"{met_val.get('max_dd',0)*100:>7.1f}%  "
+                  f"{yr.get(2023,0):>6.1f}%  {yr.get(2024,0):>6.1f}%  "
+                  f"{oos:>7.1f}%")
+            sweep_rows.append({'max_slots': ms,
+                                'val_annual': met_val.get('annual_ret',0)*100,
+                                'val_sharpe': met_val.get('sharpe',0),
+                                'val_maxdd':  met_val.get('max_dd',0)*100,
+                                'ret_2023': yr.get(2023,0), 'ret_2024': yr.get(2024,0),
+                                'ret_2025': oos})
+        print("\n完成（SWEEP 模式，不输出图表）。")
+        return
+
+    # ── H10/H5 权重横扫模式 ───────────────────────────────────────────────────
+    if args.sweep_weight:
+        global H10_WEIGHT, H5_WEIGHT
+        weight_pairs = [(0.50, 0.50), (0.60, 0.40), (0.65, 0.35),
+                        (0.70, 0.30), (0.75, 0.25), (0.80, 0.20)]
+        VAL_END    = '2024-12-31'
+        TEST_START = '2025-01-01'
+        print("\n[SWEEP] H10/H5 权重横扫对比")
+        print(f"  参数选择依据：验证期 2023-2024 年化收益 & 夏普（不得使用2025列选参）")
+        print(f"  {'H10':>5}  {'H5':>5}  {'val年化':>7}  {'val夏普':>6}  {'valMaxDD':>8}  "
+              f"{'2023':>7}  {'2024':>7}  {'OOS2025':>8}")
+        for w10, w5 in weight_pairs:
+            H10_WEIGHT = w10
+            H5_WEIGHT  = w5
+            cs_preds_w = load_cs_predictions()
+            eq, _ = run_backtest(
+                price_pv, ma5_pv, ma20_pv, vol_pv,
+                cs_preds_w, index_slots, eligible, rebal_set,
+                csi300_mom=csi300_mom, retvol20_pv=retvol20_pv,
+                open_pv=open_pv, pct_chg_pv=pct_chg_pv,
+            )
+            eq_val  = eq[eq.index <= VAL_END]
+            met_val = compute_metrics(eq_val) if len(eq_val) > 20 else {}
+            yr = {}
+            for y in [2023, 2024, 2025]:
+                sub = eq[eq.index.year == y]
+                yr[y] = (sub['total_value'].iloc[-1] / sub['total_value'].iloc[0] - 1) * 100 if len(sub) > 1 else 0
+            print(f"  {int(w10*100):>4}%  {int(w5*100):>4}%  "
+                  f"{met_val.get('annual_ret',0)*100:>6.1f}%  "
+                  f"{met_val.get('sharpe',0):>6.3f}  "
+                  f"{met_val.get('max_dd',0)*100:>7.1f}%  "
+                  f"{yr.get(2023,0):>6.1f}%  {yr.get(2024,0):>6.1f}%  "
+                  f"{yr.get(2025,0):>7.1f}%")
+        print("\n完成（SWEEP_WEIGHT 模式，不输出图表）。")
+        return
 
     # 6. 运行回测
     print("\n[5/6] 运行回测...")

@@ -16,7 +16,7 @@
 
 输出:
   1. 大盘择时信号 (slots: 0 / 10 / 20)
-  2. 今日买入候选列表（H10+H5 ensemble 排名，去除涨停）
+  2. 今日买入候选列表（H10×80%+H5×20% ensemble 排名，去除涨停）
   3. 当前持仓退出信号（止损 / MA死叉）
 """
 
@@ -73,16 +73,21 @@ _DIVIDER = '═' * 72
 
 # ─── 特征列（与训练脚本保持一致）─────────────────────────────────────────────
 TECH_COLS    = ['ret_1d', 'ret_5d', 'ret_20d', 'ret_60d', 'ret_120d',
-                'vol_20d', 'close_vs_ma20', 'close_vs_ma60', 'close_vs_ma120', 'rsi_14']
+                'vol_20d', 'close_vs_ma20', 'close_vs_ma60', 'close_vs_ma120', 'rsi_14',
+                'amplitude_1d', 'open_vs_close', 'dist_from_high_5d', 'dist_from_low_5d',
+                'dist_from_high_20d', 'high_low_ratio_20d', 'vol_ratio_5_20',
+                'vwap_dev_1d', 'vwap_dev_ma5']
 BASIC_COLS   = ['pe_ttm', 'pb', 'log_mktcap', 'turnover_20d', 'volume_ratio', 'dv_ratio']
 MF_COLS      = ['mf_1d_mv', 'mf_5d_mv', 'mf_20d_mv',
-                'large_net_5d_ratio', 'large_net_20d_ratio']
-FUND_COLS    = ['roe_ann', 'roa', 'gross_margin', 'debt_ratio',
-                'current_ratio', 'fscore', 'rev_growth_yoy', 'ni_growth_yoy',
-                'gross_margin_chg_yoy', 'ocf_to_ni']
-ANALYST_COLS = ['analyst_count', 'np_yield']
+                'large_net_5d_ratio', 'large_net_20d_ratio',
+                'retail_net_5d_ratio', 'smart_retail_divergence_5d']
+FUND_COLS    = ['roe_ann', 'roa', 'fscore', 'rev_growth_yoy', 'ni_growth_yoy',
+                'gross_margin_chg_yoy']
+ANALYST_COLS = ['analyst_count', 'np_yield', 'analyst_rev_30d']
 HOLDER_COLS  = ['holder_chg_qoq']
-ALL_FEATURES = TECH_COLS + BASIC_COLS + MF_COLS + FUND_COLS + ANALYST_COLS + HOLDER_COLS
+CROSS_COLS   = ['smart_momentum', 'momentum_adj_reversal', 'quality_value_score']
+SUE_COLS     = ['sue']
+ALL_FEATURES = TECH_COLS + BASIC_COLS + MF_COLS + FUND_COLS + ANALYST_COLS + HOLDER_COLS + SUE_COLS + CROSS_COLS
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -179,7 +184,8 @@ def get_inference_date(conn, target_date: str = None):
 def load_tech_features(conn, warmup_start: str, infer_date: str) -> pd.DataFrame:
     df = conn.execute(f"""
         WITH dp AS (
-            SELECT ts_code, trade_date, close, pct_chg, vol
+            SELECT ts_code, trade_date, open, high, low, close, pct_chg, vol,
+                   amount, adj_factor
             FROM daily_price
             WHERE trade_date >= '{warmup_start}' AND trade_date <= '{infer_date}'
               AND ts_code NOT LIKE '8%'
@@ -197,7 +203,25 @@ def load_tech_features(conn, warmup_start: str, infer_date: str) -> pd.DataFrame
                     * SQRT(252)                               AS vol_20d,
                 AVG(close) OVER (w ROWS BETWEEN 19  PRECEDING AND CURRENT ROW) AS ma20,
                 AVG(close) OVER (w ROWS BETWEEN 59  PRECEDING AND CURRENT ROW) AS ma60,
-                AVG(close) OVER (w ROWS BETWEEN 119 PRECEDING AND CURRENT ROW) AS ma120
+                AVG(close) OVER (w ROWS BETWEEN 119 PRECEDING AND CURRENT ROW) AS ma120,
+                -- Alpha158 features
+                (high - low) / NULLIF(LAG(close,1) OVER w, 0)  AS amplitude_1d,
+                (close - open) / NULLIF(open, 0)               AS open_vs_close,
+                close / NULLIF(MAX(high) OVER (w ROWS BETWEEN 4  PRECEDING AND CURRENT ROW), 0) - 1 AS dist_from_high_5d,
+                close / NULLIF(MAX(high) OVER (w ROWS BETWEEN 19 PRECEDING AND CURRENT ROW), 0) - 1 AS dist_from_high_20d,
+                close / NULLIF(MIN(low)  OVER (w ROWS BETWEEN 4  PRECEDING AND CURRENT ROW), 0) - 1 AS dist_from_low_5d,
+                MAX(high) OVER (w ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) /
+                  NULLIF(MIN(low) OVER (w ROWS BETWEEN 19 PRECEDING AND CURRENT ROW), 0) - 1
+                                                              AS high_low_ratio_20d,
+                AVG(vol) OVER (w ROWS BETWEEN 4  PRECEDING AND CURRENT ROW) /
+                NULLIF(AVG(vol) OVER (w ROWS BETWEEN 19 PRECEDING AND CURRENT ROW), 0) AS vol_ratio_5_20,
+                -- VWAP 偏离度：amount单位千元，vol单位手(100股)；adj_factor抵消
+                (close / NULLIF(adj_factor, 0) - amount * 10.0 / NULLIF(vol, 0))
+                  / NULLIF(amount * 10.0 / NULLIF(vol, 0), 0)   AS vwap_dev_1d,
+                AVG((close / NULLIF(adj_factor, 0) - amount * 10.0 / NULLIF(vol, 0))
+                  / NULLIF(amount * 10.0 / NULLIF(vol, 0), 0))
+                  OVER (w ROWS BETWEEN 4 PRECEDING AND CURRENT ROW)
+                                                              AS vwap_dev_ma5
             FROM dp
             WINDOW w AS (PARTITION BY ts_code ORDER BY trade_date)
         ),
@@ -223,6 +247,10 @@ def load_tech_features(conn, warmup_start: str, infer_date: str) -> pd.DataFrame
             t.close / NULLIF(t.ma20,   0) - 1            AS close_vs_ma20,
             t.close / NULLIF(t.ma60,   0) - 1            AS close_vs_ma60,
             t.close / NULLIF(t.ma120,  0) - 1            AS close_vs_ma120,
+            t.amplitude_1d, t.open_vs_close,
+            t.dist_from_high_5d, t.dist_from_low_5d,
+            t.dist_from_high_20d, t.high_low_ratio_20d, t.vol_ratio_5_20,
+            t.vwap_dev_1d, t.vwap_dev_ma5,
             d.pe_ttm, d.pb, d.log_mktcap, d.total_mv_100m,
             d.turnover_20d, d.volume_ratio, d.dv_ratio
         FROM tech t
@@ -267,6 +295,10 @@ def load_moneyflow(conn, warmup_start: str, infer_date: str) -> pd.DataFrame:
                 PARTITION BY ts_code ORDER BY trade_date
                 ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
             )  AS large_net_20d,
+            SUM(buy_sm_amount - sell_sm_amount) OVER (
+                PARTITION BY ts_code ORDER BY trade_date
+                ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
+            )  AS retail_net_5d,
             SUM(buy_sm_amount + buy_md_amount + buy_lg_amount + buy_elg_amount
                 + sell_sm_amount + sell_md_amount + sell_lg_amount + sell_elg_amount) OVER (
                 PARTITION BY ts_code ORDER BY trade_date
@@ -377,9 +409,8 @@ def load_fundamental(conn) -> pd.DataFrame:
     df = df.merge(dd[keep], on=["ts_code", "end_date"], how="left")
 
     fund_cols = ["ts_code", "f_ann_date", "end_date",
-                 "roe_ann", "roa", "gross_margin", "debt_ratio", "current_ratio",
-                 "fscore", "rev_growth_yoy", "ni_growth_yoy",
-                 "gross_margin_chg_yoy", "ocf_to_ni"]
+                 "roe_ann", "roa", "fscore", "rev_growth_yoy", "ni_growth_yoy",
+                 "gross_margin_chg_yoy"]
     result = df[fund_cols].dropna(subset=["f_ann_date"]).copy()
     result["f_ann_date"] = result["f_ann_date"].astype(str)
     return result.sort_values(["ts_code", "f_ann_date"]).reset_index(drop=True)
@@ -392,9 +423,8 @@ def pit_join(fund_df: pd.DataFrame, ts_codes: list, infer_date: str) -> pd.DataF
     fund_df = fund_df.copy()
     fund_df["_ann_int"] = fund_df["f_ann_date"].str.replace("-", "").astype(int)
 
-    fund_cols = ["roe_ann", "roa", "gross_margin", "debt_ratio", "current_ratio",
-                 "fscore", "rev_growth_yoy", "ni_growth_yoy",
-                 "gross_margin_chg_yoy", "ocf_to_ni"]
+    fund_cols = ["roe_ann", "roa", "fscore", "rev_growth_yoy", "ni_growth_yoy",
+                 "gross_margin_chg_yoy"]
 
     grouped = {ts: grp.sort_values("_ann_int").reset_index(drop=True)
                for ts, grp in fund_df.groupby("ts_code")}
@@ -419,24 +449,38 @@ def pit_join(fund_df: pd.DataFrame, ts_codes: list, infer_date: str) -> pd.DataF
 
 def load_analyst(conn, infer_date: str, mv_map: dict) -> pd.DataFrame:
     win_start = (pd.to_datetime(infer_date) - pd.Timedelta(days=90)).strftime("%Y%m%d")
+    old_start = (pd.to_datetime(infer_date) - pd.Timedelta(days=90)).strftime("%Y%m%d")
     rc_df = conn.execute(f"""
         SELECT ts_code, report_date, np
         FROM report_rc
         WHERE np IS NOT NULL AND np > 0
-          AND report_date >= '{win_start}' AND report_date <= '{infer_date}'
+          AND report_date >= '{old_start}' AND report_date <= '{infer_date}'
         ORDER BY ts_code, report_date
     """).fetchdf()
     rc_df["report_date"] = rc_df["report_date"].astype(str)
 
     if rc_df.empty:
-        return pd.DataFrame(columns=["ts_code", "analyst_count", "np_yield"])
+        return pd.DataFrame(columns=["ts_code", "analyst_count", "np_yield", "analyst_rev_30d"])
 
+    # analyst_count and np_yield (last 90d)
     agg = rc_df.groupby("ts_code")["np"].agg(analyst_count="count", np_median="median").reset_index()
     agg["np_yield"] = agg.apply(
         lambda r: r["np_median"] / mv_map.get(r["ts_code"], np.nan)
         if pd.notna(mv_map.get(r["ts_code"], np.nan)) and mv_map.get(r["ts_code"], 0) > 0
         else np.nan, axis=1)
-    return agg.drop(columns=["np_median"])
+    agg = agg.drop(columns=["np_median"])
+
+    # analyst_rev_30d: (recent 30d median) / (31-90d median) - 1
+    recent_start = (pd.to_datetime(infer_date) - pd.Timedelta(days=30)).strftime("%Y%m%d")
+    old_end      = (pd.to_datetime(infer_date) - pd.Timedelta(days=31)).strftime("%Y%m%d")
+    mask_recent = (rc_df["report_date"] >= recent_start) & (rc_df["report_date"] <= infer_date)
+    mask_old    = (rc_df["report_date"] >= old_start) & (rc_df["report_date"] <= old_end)
+    recent_np = rc_df[mask_recent].groupby("ts_code")["np"].median().rename("recent_np")
+    old_np    = rc_df[mask_old   ].groupby("ts_code")["np"].median().rename("old_np")
+    rev = pd.concat([recent_np, old_np], axis=1).reset_index()
+    rev["analyst_rev_30d"] = (rev["recent_np"] / rev["old_np"].replace(0, np.nan) - 1).clip(-1.0, 2.0)
+    agg = agg.merge(rev[["ts_code", "analyst_rev_30d"]], on="ts_code", how="left")
+    return agg
 
 
 def load_holder_pit(conn, ts_codes: list, infer_date: str) -> pd.DataFrame:
@@ -477,6 +521,54 @@ def load_holder_pit(conn, ts_codes: list, infer_date: str) -> pd.DataFrame:
     return pd.DataFrame(results)
 
 
+def load_sue_pit(conn, infer_date: str, max_lag_days: int = 90) -> pd.DataFrame:
+    """PIT SUE: (actual_np - consensus_np) / |consensus_np|, 披露后 max_lag_days 内有效"""
+    is_df = conn.execute("""
+        WITH is_t AS (
+            SELECT ts_code, end_date,
+                   MIN(COALESCE(f_ann_date, ann_date)) AS f_ann_date,
+                   FIRST(n_income_attr_p ORDER BY ann_date DESC) AS actual_np
+            FROM income_statement WHERE comp_type = '1'
+            GROUP BY ts_code, end_date
+        )
+        SELECT * FROM is_t WHERE f_ann_date IS NOT NULL AND actual_np IS NOT NULL
+    """).fetchdf()
+    if is_df.empty:
+        return pd.DataFrame(columns=["ts_code", "sue"])
+
+    month_to_q = {"03": "Q1", "06": "Q2", "09": "Q3", "12": "Q4"}
+    is_df["quarter"] = is_df["end_date"].astype(str).str[:4] + \
+                       is_df["end_date"].astype(str).str[4:6].map(month_to_q)
+    is_df["f_ann_date"] = is_df["f_ann_date"].astype(str)
+
+    rc_df = conn.execute("""
+        SELECT ts_code, report_date, quarter, np FROM report_rc
+        WHERE np IS NOT NULL AND np > 0
+    """).fetchdf()
+    rc_df["report_date"] = rc_df["report_date"].astype(str)
+
+    merged = is_df.merge(rc_df, on=["ts_code", "quarter"])
+    if merged.empty:
+        return pd.DataFrame(columns=["ts_code", "sue"])
+
+    days_before = (pd.to_datetime(merged["f_ann_date"]) - pd.to_datetime(merged["report_date"])).dt.days
+    merged = merged[(days_before >= 5) & (days_before <= 180)]
+    consensus = merged.groupby(["ts_code", "end_date", "f_ann_date", "actual_np"])["np"].agg(
+        consensus_median="median", n_analysts="count").reset_index()
+    consensus = consensus[consensus["n_analysts"] >= 2]
+    consensus["sue"] = ((consensus["actual_np"] - consensus["consensus_median"]) /
+                        consensus["consensus_median"].abs().replace(0, np.nan)).clip(-2.0, 2.0)
+
+    # PIT: keep only f_ann_date <= infer_date and within max_lag_days
+    td_dt = pd.to_datetime(infer_date)
+    sue_valid = consensus[pd.to_datetime(consensus["f_ann_date"]) <= td_dt].copy()
+    sue_valid["days_since"] = (td_dt - pd.to_datetime(sue_valid["f_ann_date"])).dt.days
+    sue_valid = sue_valid[sue_valid["days_since"] <= max_lag_days]
+    # For each stock, keep the most recent announcement
+    sue_valid = sue_valid.sort_values("f_ann_date").groupby("ts_code").last().reset_index()
+    return sue_valid[["ts_code", "sue"]]
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # 4. 预处理（与训练脚本完全一致）
 # ════════════════════════════════════════════════════════════════════════════
@@ -502,7 +594,8 @@ def preprocess_single_date(df: pd.DataFrame, feature_cols: list) -> pd.DataFrame
 
     if len(df) > 20 and "industry" in df.columns and "log_mktcap" in df.columns:
         neut_cols = [c for c in feature_cols
-                     if c not in ("log_mktcap", "fscore", "analyst_count")]
+                     if c not in ("log_mktcap", "fscore", "analyst_count",
+                                  "analyst_rev_30d", "sue")]
         industries = pd.get_dummies(df["industry"], prefix="ind", drop_first=True, dtype=float)
         logmv = df["log_mktcap"].fillna(df["log_mktcap"].median())
         X_ctrl = pd.concat([logmv.rename("log_mktcap"), industries], axis=1).values.astype(float)
@@ -602,7 +695,7 @@ def predict_scores(models: dict, features_map: dict, panel_today: pd.DataFrame) 
     生成 H10+H5 ensemble 得分（与回测策略 load_cs_predictions 逻辑一致）。
     H10: XGB + LGB rank 平均 → r10
     H5:  XGB only            → r5
-    final pred = 0.7 * r10 + 0.3 * r5
+    final pred = 0.8 * r10 + 0.2 * r5
     """
     df = panel_today.copy()
 
@@ -635,7 +728,7 @@ def predict_scores(models: dict, features_map: dict, panel_today: pd.DataFrame) 
     else:
         df["r5"] = df.get("r10", 0.5)
 
-    df["score"] = 0.7 * df["r10"] + 0.3 * df["r5"]
+    df["score"] = 0.8 * df["r10"] + 0.2 * df["r5"]
     return df
 
 
@@ -1133,11 +1226,13 @@ def main():
     mf_td = mf_df[mf_df["trade_date"] == target_date].copy()
     tech_td = tech_td.merge(mf_td, on=["ts_code", "trade_date"], how="left")
     mv_wan = tech_td["total_mv_100m"] * 10000
-    tech_td["mf_1d_mv"]            = tech_td["mf_1d_raw"]  / mv_wan.replace(0, np.nan)
-    tech_td["mf_5d_mv"]            = tech_td["mf_5d_raw"]  / mv_wan.replace(0, np.nan)
-    tech_td["mf_20d_mv"]           = tech_td["mf_20d_raw"] / mv_wan.replace(0, np.nan)
-    tech_td["large_net_5d_ratio"]  = tech_td["large_net_5d"]  / tech_td["total_flow_5d"].replace(0, np.nan)
-    tech_td["large_net_20d_ratio"] = tech_td["large_net_20d"] / tech_td["total_flow_20d"].replace(0, np.nan)
+    tech_td["mf_1d_mv"]                   = tech_td["mf_1d_raw"]  / mv_wan.replace(0, np.nan)
+    tech_td["mf_5d_mv"]                   = tech_td["mf_5d_raw"]  / mv_wan.replace(0, np.nan)
+    tech_td["mf_20d_mv"]                  = tech_td["mf_20d_raw"] / mv_wan.replace(0, np.nan)
+    tech_td["large_net_5d_ratio"]         = tech_td["large_net_5d"]  / tech_td["total_flow_5d"].replace(0, np.nan)
+    tech_td["large_net_20d_ratio"]        = tech_td["large_net_20d"] / tech_td["total_flow_20d"].replace(0, np.nan)
+    tech_td["retail_net_5d_ratio"]        = tech_td["retail_net_5d"] / tech_td["total_flow_5d"].replace(0, np.nan)
+    tech_td["smart_retail_divergence_5d"] = tech_td["large_net_5d_ratio"] - tech_td["retail_net_5d_ratio"]
 
     # 基本面 PIT
     fund_pit = pit_join(fund_df, ts_codes_today, target_date)
@@ -1153,9 +1248,19 @@ def main():
     holder_pit = load_holder_pit(conn, ts_codes_today, target_date)
     tech_td = tech_td.merge(holder_pit[["ts_code", "holder_chg_qoq"]], on="ts_code", how="left")
 
+    # SUE
+    sue_df = load_sue_pit(conn, target_date)
+    tech_td = tech_td.merge(sue_df, on="ts_code", how="left")
+
     # 行业
     tech_td = tech_td.merge(stock_info, on="ts_code", how="left")
     tech_td["industry"] = tech_td["industry"].fillna("未知")
+
+    # 交叉特征
+    pe_safe = tech_td["pe_ttm"].clip(lower=5.0)
+    tech_td["smart_momentum"]          = tech_td["ret_20d"] * tech_td["large_net_20d_ratio"]
+    tech_td["momentum_adj_reversal"]   = tech_td["ret_60d"] - tech_td["ret_5d"]
+    tech_td["quality_value_score"]     = tech_td["ni_growth_yoy"] / pe_safe
 
     print(f"  特征组装完成: {len(tech_td)} 只股票")
 
@@ -1281,7 +1386,7 @@ def main():
             shown += 1
 
     print(f"\n{'═'*65}")
-    print(f"  说明：得分为 H10×70% + H5×30% 截面百分位，越高越优")
+    print(f"  说明：得分为 H10×80% + H5×20% 截面百分位，越高越优")
     # 从已保存的 features_h10.json 中读取 train_end 显示
     try:
         with open(MODELS_DIR / "features_h10.json") as _f:
